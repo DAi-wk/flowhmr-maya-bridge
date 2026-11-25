@@ -9,8 +9,8 @@
   },
   "sides": [["L", "Left"], ["R", "Right"]],
   "chains": [
-    {"name": "spine", "align_from": 1,
-     "links": [["Hips", "FKRoot_M"], ["Spine1", "FKSpine1_M"], ["Spine2", "FKChest_M"], ["Neck", "FKNeck_M"], ["Head", "FKHead_M"]]},
+    {"name": "spine", "align_from": 0,
+     "links": [["Spine", "FKRoot_M"], ["Spine1", "FKSpine1_M"], ["Spine2", "FKChest_M"], ["Neck", "FKNeck_M"], ["Head", "FKHead_M"]]},
     {"name": "arm_{s}",
      "links": [["{Side}Shoulder", "FKScapula_{s}"], ["{Side}Arm", "FKShoulder_{s}"], ["{Side}ForeArm", "FKElbow_{s}"], ["{Side}Hand", "FKWrist_{s}"]],
      "end_aim": ["{Side}HandMiddle1", "FKMiddleFinger1_{s}"]},

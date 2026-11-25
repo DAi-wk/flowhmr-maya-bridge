@@ -114,8 +114,12 @@ def drift(rows_a, rows_b):
 
 
 def clear_keys():
-    """Delete the time-based keys on the rig's ControlSet (left by a previous run)."""
+    """Delete the rig's FlowHMR layers (each apply bakes onto one) and the time-based keys on
+    its ControlSet (left by a previous run)."""
+    from flowhmr_bridge import layers
     ns = STATE["ns"]
+    for layer in reversed(layers.flowhmr_layers(ns)):
+        layers.remove_layer(layer, restore_range=False)
     curves = set()
     for member in cmds.sets(ns + "ControlSet", q=True) or []:
         for curve in cmds.listConnections(member, s=True, d=False, type="animCurve") or []:

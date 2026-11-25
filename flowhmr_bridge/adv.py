@@ -17,6 +17,7 @@ from pathlib import Path
 import maya.cmds as cmds
 import maya.mel as mel
 
+from . import layers
 from . import timing as timing_mod
 
 TESTED_ADV = ("6.755",)
@@ -176,19 +177,20 @@ def inspect_rig(main, overwrite=False):
     result["animated"] = animated_controls(namespace)
     if result["animated"] and not overwrite:
         result["issues"].append(
-            f"有 {len(result['animated'])} 個控制器已經有動畫。ADV 會在第 -1 幀依目前姿勢算偏移，"
-            "並重烘全部 ControlSet。要取代原動畫，請勾選「覆蓋現有動畫」。")
+            f"有 {len(result['animated'])} 個控制器已經有動畫。要疊上 FlowHMR 的動作，請勾選「rig 已有動畫時也套用」。")
     elif result["animated"]:
-        _, blocked = _sources(namespace)
-        if blocked:
-            result["issues"].append(
-                f"{len(blocked)} 個控制器的動畫在動畫層或 pairBlend 上（例如 {', '.join(blocked[:3])}），"
-                "無法自動備份。請先合併動畫層，或刪掉這些控制器的動畫。")
-        else:
-            result["notes"].append(f"將覆蓋 {len(result['animated'])} 個控制器的動畫；原動畫會先備份在場景裡，可以還原。")
+        result["notes"].append(f"{len(result['animated'])} 個控制器已經有動畫：FlowHMR 的動作會放在新的動畫層，原動畫保留在下層。")
     for node in backups(namespace):
-        result["notes"].append(f"場景中有覆蓋前的備份：{node}。")
+        result["notes"].append(f"場景中有舊版的覆蓋備份：{node}（可用「還原」按鈕找回）。")
     return result
+
+
+def controlset_plugs(namespace):
+    """Every keyable channel ADV's Bake Body may key."""
+    plugs = []
+    for member in cmds.sets(namespace + "ControlSet", q=True) or []:
+        plugs += [f"{member}.{attr}" for attr in cmds.listAttr(member, keyable=True, unlocked=True) or []]
+    return plugs
 
 
 # ------------------------------------------------------------------ overwrite backups
@@ -377,12 +379,13 @@ def _restore_adv_ui(previous):
 
 # ------------------------------------------------------------------ apply
 def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=None, on_baked=None,
-          overwrite=False):
-    """Connect, bake, euler-filter and set the frame rate. Returns a summary dict.
+          overwrite=False, label=None):
+    """Connect, bake, euler-filter, move the keys onto a new override animation layer and set
+    the frame rate. Returns a summary dict.
 
     ``target_unit`` is a Maya time unit; None keeps the scene's rate from before the call.
-    ``overwrite`` detaches existing keys into a backup node first (see restore_backup);
-    if the apply fails, the backup is put back automatically.
+    ``overwrite`` allows a rig that already has animation: it is detached for the bake and put
+    back under the FlowHMR layer (see layers.Channels); a failed apply puts it back as well.
     ``on_connected(ns)`` / ``on_baked(ns)`` run at 30 FPS before and after the bake (for tests).
     """
     started = time.time()
@@ -393,7 +396,7 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
         raise ApplyError(" ".join(rig["issues"]))
     namespace = rig["namespace"]
     version, _ = ensure_adv()
-    notes = [note for note in rig["notes"] if not note.startswith(("將覆蓋", "場景中有覆蓋前的備份"))]
+    notes = [note for note in rig["notes"] if "已經有動畫" not in note and "舊版的覆蓋備份" not in note]
     if version not in TESTED_ADV:
         notes.append(f"AdvancedSkeleton {version} 未實測（已測 {', '.join(TESTED_ADV)}）。")
     fbx = _stage(fbx)
@@ -402,12 +405,15 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
     curves_before = set(cmds.ls(type="animCurve"))
     previous_option = cmds.optionVar(q=OPTION_VAR) if cmds.optionVar(exists=OPTION_VAR) else None
     log(f"套用 {fbx.name} → {main}")
-    backup = None
+    label = label or fbx.stem.replace("_maya_adv", "")
+    channels = layers.Channels(controlset_plugs(namespace), label=label)
+    previous_range = layers.range_seconds()
+    layer = None
+    if channels.animated:
+        log(f"{len(channels.animated)} 個控制器已有動畫：烘焙時先拆下，烘焙後放回動畫層下方。")
     cmds.undoInfo(openChunk=True, chunkName="FlowHMR apply")
     try:
-        if rig["animated"]:
-            backup = backup_animation(main, namespace, label=fbx.name)
-            log(f"原動畫已備份到 {backup}（{len(rig['animated'])} 個控制器）")
+        channels.free()
         timing.prepare()
         cmds.currentTime(-1, edit=True)
         if build_pose:
@@ -453,15 +459,28 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
         log(f"烘焙完成（{time.time() - bake_started:.1f} 秒），修正 {flips} 條 euler 翻轉曲線")
         if on_baked:
             on_baked(namespace)
+        baked = []
+        for plug in controlset_plugs(namespace):
+            source = cmds.connectionInfo(plug, sourceFromDestination=True)
+            node = source.split(".", 1)[0] if source else None
+            if node and node not in curves_before and cmds.nodeType(node).startswith("animCurveT"):
+                baked.append(plug)
+        info = {"namespace": namespace, "mode": "adv", "rig": main, "label": label, "created": time.time(),
+                "range_seconds": previous_range}
+        layer, layer_curves, unheld = layers.to_layer(channels, baked, {}, layers.layer_name(namespace, label), info,
+                                                      bake_range[0])
+        log(f"已放進動畫層 {layer}（{len(layer_curves)} 條曲線）。把這個動畫層靜音或刪除，就回到原本的動畫。")
+        if unheld:
+            notes.append(f"{len(unheld)} 個屬性無法放進動畫層，已直接設成套用時的值：{', '.join(p.split(':')[-1] for p in unheld[:6])}")
 
         timing.finish(target)
-        keys = key_report(namespace)
+        keys = layers.key_report(layer_curves)
         fps = timing_mod.scene_fps()
         if keys["fractional_keys"]:
             notes.append(f"{fps:g} fps 不是 30 的倍數，{keys['fractional_keys']} 個 key 落在小數幀。")
         cmds.currentTime(0, edit=True)
         cmds.select(clear=True)
-        return {"main": main, "namespace": namespace, "fbx": str(fbx), "adv_version": version, "backup": backup,
+        return {"main": main, "namespace": namespace, "fbx": str(fbx), "adv_version": version, "layer": layer,
                 "driven_controls": len(driven), "fingers": fingers, "source_frames": len(source_keys or []),
                 "bake_range_30fps": bake_range, "euler_flips_fixed": flips, "time_unit": cmds.currentUnit(q=True, time=True),
                 "fps": fps, "keys": keys, "playback": (cmds.playbackOptions(q=True, min=True),
@@ -469,16 +488,16 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
                 "notes": notes, "seconds": round(time.time() - started, 2)}
     except Exception as error:
         removed, problems = 0, []
-        steps = [_remove_mocap, lambda: _remove_new_keys(namespace, curves_before), timing.abort]
-        if backup:
-            steps.append(lambda: restore_backup(backup))
+        steps = [_remove_mocap,
+                 lambda: layers.remove_layer(layer, restore_range=False) if layer and cmds.objExists(layer) else None,
+                 lambda: _remove_new_keys(namespace, curves_before), channels.restore, timing.abort]
         for step in steps:
             try:
                 value = step()
                 removed = value if isinstance(value, int) else removed
             except Exception as cleanup_error:  # keep going: the frame rate must come back
                 problems.append(str(cleanup_error))
-        log(f"套用失敗，已清除動捕骨架與 {removed} 條新曲線{'，並還原原動畫' if backup else ''}：{error}")
+        log(f"套用失敗，已清除動捕骨架與 {removed} 條新曲線{'，並接回原動畫' if channels.sources else ''}：{error}")
         if problems:
             log("清理時有問題，請檢查場景：" + "；".join(problems))
         if isinstance(error, ApplyError):

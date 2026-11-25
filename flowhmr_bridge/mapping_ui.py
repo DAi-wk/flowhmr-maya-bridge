@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 import maya.cmds as cmds
@@ -248,6 +249,7 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.path, self.extra = None, {}
         self.selected_key = "root"
         self._items, self._status, self._figures = {}, {}, []
+        self._saved_state, self._loaded_name, self._closing = None, "", False
         self._build()
         self.refresh_namespaces(namespace)
         if path:
@@ -255,6 +257,10 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         else:
             self.new()
         self.select_slot("root")
+        # Cheap comparison of the whole definition, so every kind of edit is noticed.
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._refresh_banner)
+        self._timer.start(400)
 
     # ------------------------------------------------------------------ layout
     def _build(self):
@@ -273,7 +279,8 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         row.addWidget(QtWidgets.QLabel("設定名稱"))
         self.name_edit = QtWidgets.QLineEdit()
         row.addWidget(self.name_edit, 1)
-        for label, slot in (("開新", self.new), ("開啟…", self.open_file), ("儲存", self.save), ("另存…", self.save_as)):
+        for label, slot in (("開新", self.new), ("開啟…", self.open_file), ("儲存", self.save), ("另存…", self.save_as),
+                            ("匯入 preset…", self.import_preset_file)):
             button = QtWidgets.QPushButton(label)
             button.clicked.connect(slot)
             row.addWidget(button)
@@ -282,8 +289,7 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("從範本"))
         self.template_combo = QtWidgets.QComboBox()
-        for name, path, _builtin in generic.list_profiles():
-            self.template_combo.addItem(name, str(path))
+        self._refresh_templates()
         load_template = QtWidgets.QPushButton("載入")
         load_template.clicked.connect(self.load_template)
         row.addWidget(self.template_combo, 1)
@@ -299,7 +305,21 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         self.file_label = QtWidgets.QLabel()
         self.file_label.setStyleSheet("color: #909090;")
+        self.file_label.setWordWrap(True)
         layout.addWidget(self.file_label)
+        self.banner = QtWidgets.QFrame()
+        self.banner.setStyleSheet("QFrame { background: #4a3a1c; border-radius: 3px; }")
+        banner_row = QtWidgets.QHBoxLayout(self.banner)
+        banner_row.setContentsMargins(6, 4, 6, 4)
+        self.banner_label = QtWidgets.QLabel()
+        self.banner_label.setWordWrap(True)
+        self.banner_label.setStyleSheet("color: #f0c060; background: transparent;")
+        self.banner_button = QtWidgets.QPushButton("另存…")
+        self.banner_button.clicked.connect(self.save)
+        banner_row.addWidget(self.banner_label, 1)
+        banner_row.addWidget(self.banner_button)
+        self.banner.setVisible(False)
+        layout.addWidget(self.banner)
 
         row = QtWidgets.QHBoxLayout()
         auto = QtWidgets.QPushButton("自動偵測")
@@ -758,13 +778,117 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             self._add_hold(plug, value)
         self.extra = dict(extra)
         self.path = Path(path) if path else None
-        builtin = self.path is not None and self.path.parent == generic.PROFILE_DIR
-        self.file_label.setText("尚未存檔" if not self.path else
-                                f"{self.path}" + ("（內建範本，儲存時會另存一份）" if builtin else ""))
+        self._show_file()
         self.validate()
         self.select_slot(self.selected_key)
+        self._loaded_name = name
+        self._mark_saved()
+
+    def _show_file(self):
+        if not self.path:
+            text = "尚未存檔"
+        elif self.readonly():
+            kind = "內建範本" if self.path.parent.resolve() == generic.PROFILE_DIR.resolve() else "preset"
+            text = f"{self.path}（{kind}：不能直接修改，儲存時會另存成新的設定檔）"
+        else:
+            text = str(self.path)
+        self.file_label.setText(text)
+
+    # ------------------------------------------------------------------ unsaved edits
+    def readonly(self):
+        return self.path is not None and generic.is_preset(self.path)
+
+    def _state(self):
+        try:
+            hold = self.hold()
+        except Exception:
+            hold = {}
+        return json.dumps({"name": self.name_edit.text().strip(), "slots": self.slots(), "hold": hold,
+                           "rest": self.rest_current.isChecked(), "limbs": self.limbs()},
+                          sort_keys=True, ensure_ascii=False, default=str)
+
+    def is_dirty(self):
+        return self._saved_state is not None and self._state() != self._saved_state
+
+    def _mark_saved(self):
+        self._saved_state = self._state()
+        self._refresh_banner()
+
+    def _refresh_banner(self):
+        if not hasattr(self, "banner"):
+            return
+        dirty = self.is_dirty()
+        if dirty and self.readonly():
+            self.banner_label.setText("這是 preset，不能直接修改。要保留這些改動，請按「另存…」存成新的設定檔。")
+            self.banner_button.setText("另存…")
+        elif dirty:
+            self.banner_label.setText("有尚未儲存的修改。")
+            self.banner_button.setText("儲存")
+        self.banner.setVisible(dirty)
+
+    def _ask_unsaved(self, allow_cancel=True):
+        """'save', 'discard' or 'cancel' for the current unsaved edits."""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("FlowHMR 人形定義")
+        name = self.path.name if self.path else (self.name_edit.text().strip() or "新的設定")
+        if self.readonly():
+            box.setText(f"「{name}」是 preset，修改不能存回去。要另存成新的設定檔嗎？")
+            save = box.addButton("另存…", QtWidgets.QMessageBox.AcceptRole)
+        else:
+            box.setText(f"「{name}」有尚未儲存的修改，要儲存嗎？")
+            save = box.addButton("儲存", QtWidgets.QMessageBox.AcceptRole)
+        discard = box.addButton("不儲存", QtWidgets.QMessageBox.DestructiveRole)
+        cancel = box.addButton("取消", QtWidgets.QMessageBox.RejectRole) if allow_cancel else None
+        box.setDefaultButton(save)
+        (box.exec if hasattr(box, "exec") else box.exec_)()
+        clicked = box.clickedButton()
+        return "save" if clicked is save else "discard" if clicked is discard else "cancel"
+
+    def resolve_unsaved(self, allow_cancel=True):
+        """True when the current edits may be dropped: nothing changed, saved, or the user said so."""
+        if not self.is_dirty():
+            return True
+        answer = self._ask_unsaved(allow_cancel)
+        if answer == "save":
+            return self.save() is not None
+        return answer == "discard"
+
+    def _write_recovery(self):
+        """Closing cannot be cancelled: keep edits the user did not save or discard."""
+        folder = generic.user_profile_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = re.sub(r"[^\w\-]+", "_", self.name_edit.text().strip() or "my_rig").strip("_") or "my_rig"
+        path = folder / f"{stem}_未儲存_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        try:
+            data = self._profile()
+        except ValueError:
+            data = json.loads(self._state())
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"// FlowHMR 人形定義：未儲存的修改已另存到 {path}")
+        return path
+
+    def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        if hasattr(self, "_timer"):
+            self._timer.stop()
+        if self.is_dirty():
+            answer = self._ask_unsaved(allow_cancel=False)
+            saved = answer == "save" and self.save() is not None
+            if not saved and answer != "discard":
+                self._write_recovery()
+
+    def dockCloseEventTriggered(self):
+        self._on_close()
+
+    def closeEvent(self, event):
+        self._on_close()
+        super().closeEvent(event)
 
     def new(self):
+        if self._saved_state is not None and not self.resolve_unsaved():
+            return
         self._fill("我的 rig", {}, "zero", {}, {}, None)
 
     def load(self, path):
@@ -777,19 +901,54 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
     def load_template(self):
         path = self.template_combo.currentData()
-        if not path:
+        if not path or not self.resolve_unsaved():
             return
         self.load(path)
         self.extra.pop("test", None)
         self.path = None
         self.name_edit.setText(self.name_edit.text().replace("（內建範本）", "") + "（複本）")
         self.file_label.setText("尚未存檔（由範本建立）")
+        self._loaded_name = self.name_edit.text()
+        self._mark_saved()
+
+    def _refresh_templates(self):
+        current = self.template_combo.currentData()
+        self.template_combo.clear()
+        for name, path, _read_only in generic.list_profiles():
+            self.template_combo.addItem(name, str(path))
+        index = self.template_combo.findData(current) if current else -1
+        if index >= 0:
+            self.template_combo.setCurrentIndex(index)
 
     def open_file(self):
+        if not self.resolve_unsaved():
+            return
         start = str(generic.user_profile_dir())
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "開啟人形定義", start, "JSON (*.json)")
         if path:
             self.load(path)
+
+    def import_preset_file(self):
+        if not self.resolve_unsaved():
+            return
+        start = str(generic.user_profile_dir())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "匯入 preset（複製到 preset 資料夾，之後不能直接修改）",
+                                                        start, "JSON (*.json)")
+        if path:
+            self.import_preset(path)
+
+    def import_preset(self, path):
+        try:
+            target = generic.import_preset(path)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            QtWidgets.QMessageBox.warning(self, "FlowHMR 人形定義", f"不是可用的人形定義檔：{error}")
+            return None
+        self._refresh_templates()
+        self.load(target)
+        self.status.setText(f"已匯入 preset：{target.name}。修改後要用「另存…」存成新的設定檔。")
+        if self.on_saved:
+            self.on_saved(str(target))
+        return target
 
     def _profile(self):
         return mapping.build_profile(self.name_edit.text().strip() or "未命名", self.slots(),
@@ -797,18 +956,35 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                                      limbs=self.limbs())
 
     def save(self):
-        if self.path is None or self.path.parent == generic.PROFILE_DIR:
+        if self.path is None or self.readonly():
             return self.save_as()
         return self._write(self.path)
+
+    def _choose_save_path(self, default):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "另存人形定義", str(default), "JSON (*.json)")
+        return Path(path) if path else None
 
     def save_as(self):
         folder = generic.user_profile_dir()
         folder.mkdir(parents=True, exist_ok=True)
-        stem = re.sub(r"[^\w\-]+", "_", self.name_edit.text().strip() or "my_rig").strip("_") or "my_rig"
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "另存人形定義", str(folder / f"{stem}.json"), "JSON (*.json)")
-        return self._write(Path(path)) if path else None
+        name = self.name_edit.text().strip() or "my_rig"
+        if self.readonly() and name == self._loaded_name:
+            name += "（複本）"  # the copy should not look like the preset in the profile list
+        stem = re.sub(r"[^\w\-]+", "_", name).strip("_") or "my_rig"
+        path = self._choose_save_path(folder / f"{stem}.json")
+        if not path:
+            return None
+        if generic.is_preset(path):
+            QtWidgets.QMessageBox.warning(self, "FlowHMR 人形定義",
+                                          "preset 和內建範本的資料夾不能存檔。請存到其他位置（預設是 profiles 資料夾）。")
+            return None
+        self.name_edit.setText(name)
+        return self._write(path)
 
     def _write(self, path):
+        if generic.is_preset(path):
+            QtWidgets.QMessageBox.warning(self, "FlowHMR 人形定義", f"{path.name} 是 preset，不能直接修改。請用「另存…」。")
+            return None
         try:
             profile = self._profile()
         except ValueError as error:
@@ -821,7 +997,10 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
         self.path = path
-        self.file_label.setText(str(path))
+        self._show_file()
+        self._loaded_name = profile.get("name", "")
+        self._mark_saved()
+        self._refresh_templates()
         self.status.setText(f"已儲存：{path.name}（{len(self.slots())} 個部位）")
         if self.on_saved:
             self.on_saved(str(path))
@@ -831,6 +1010,14 @@ class MappingEditor(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 def show_editor(path=None, namespace=None, on_saved=None):
     global _editor
     control = MappingEditor.NAME + "WorkspaceControl"
+    if _editor is not None:
+        try:  # an editor that was closed already asked about its edits
+            if not _editor._closing and not _editor.resolve_unsaved():
+                _editor.raise_()
+                return _editor  # keep the open window and its edits
+            _editor._closing = True
+        except RuntimeError:  # its Qt object is already gone
+            pass
     if cmds.workspaceControl(control, exists=True):
         cmds.deleteUI(control)
     _editor = MappingEditor(path=path, namespace=namespace, on_saved=on_saved)

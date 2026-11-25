@@ -63,12 +63,14 @@ class Automap(unittest.TestCase):
 
     def test_adv(self):
         slots, _ = mapping.automap(ADV)
-        self.check(slots, {"root": "RootX_M", "pelvis": "FKRoot_M", "spine1": "FKSpine1_M", "spine2": "FKChest_M",
+        # ADV's MoCap mapping: FKRoot_M <- Spine, FKSpine1_M <- Spine1, FKChest_M <- Spine2
+        self.check(slots, {"root": "RootX_M", "spine": "FKRoot_M", "spine1": "FKSpine1_M", "spine2": "FKChest_M",
                            "neck": "FKNeck_M", "head": "FKHead_M", "clavicle_L": "FKScapula_L", "arm_L": "FKShoulder_L",
                            "forearm_R": "FKElbow_R", "hand_R": "FKWrist_R", "upleg_L": "FKHip_L", "leg_L": "FKKnee_L",
                            "foot_R": "FKAnkle_R", "toe_R": "FKToes_R", "thumb1_L": "FKThumbFinger1_L",
                            "pinky3_R": "FKPinkyFinger3_R"})
         self.assertNotIn("spine_base", slots)
+        self.assertNotIn("pelvis", slots)
 
     def test_hive(self):
         slots, _ = mapping.automap(HIVE)

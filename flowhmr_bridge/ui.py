@@ -23,7 +23,7 @@ try:
 except ImportError:  # Maya 2024 and earlier
     from PySide2 import QtCore, QtGui, QtWidgets
 
-from . import __version__, adv, generic
+from . import __version__, adv, generic, layers
 from . import client as client_mod
 from . import timing as timing_mod
 
@@ -123,9 +123,6 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         rig_row.addWidget(self.rig_combo, 1)
         rig_row.addWidget(rig_refresh)
         form.addRow("目標 rig", rig_row)
-        self.overwrite_check = QtWidgets.QCheckBox("覆蓋現有動畫（先備份在場景裡，可還原）")
-        self.overwrite_check.toggled.connect(self._update_state)
-        form.addRow("", self.overwrite_check)
         layout.addWidget(self.adv_box)
 
         # custom mode
@@ -155,6 +152,11 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         form.addRow("目標 namespace", ns_row)
         layout.addWidget(self.custom_box)
 
+        self.overwrite_check = QtWidgets.QCheckBox("rig 已有動畫時也套用（FlowHMR 放在新的動畫層，原動畫保留在下層）")
+        self.overwrite_check.setToolTip("每次套用都會建立一個新的覆蓋（override）動畫層。把它靜音或刪除，就回到原本的動畫。")
+        self.overwrite_check.toggled.connect(self._update_state)
+        layout.addWidget(self.overwrite_check)
+
         rate_form = QtWidgets.QFormLayout()
         self.rate_combo = QtWidgets.QComboBox()
         self.rate_combo.currentIndexChanged.connect(self._update_state)
@@ -170,7 +172,8 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.apply_button = QtWidgets.QPushButton("套用")
         self.apply_button.setMinimumHeight(32)
         self.apply_button.clicked.connect(self.apply)
-        self.restore_button = QtWidgets.QPushButton("還原覆蓋前的動畫")
+        self.restore_button = QtWidgets.QPushButton("移除最新的 FlowHMR 動畫層")
+        self.restore_button.setToolTip("刪除這個 rig 最新的 FlowHMR 動畫層，回到下層的動畫和套用前的播放範圍（幀率不會改回）。")
         self.restore_button.setMinimumHeight(32)
         self.restore_button.clicked.connect(self.restore)
         buttons.addWidget(self.apply_button, 2)
@@ -191,7 +194,6 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         custom = self.mode() == "custom"
         self.adv_box.setVisible(not custom)
         self.custom_box.setVisible(custom)
-        self.restore_button.setVisible(not custom)
         self.apply_button.setText("套用到自訂 rig" if custom else "套用到 ADV rig")
 
     def _mode_changed(self, *_):
@@ -375,7 +377,7 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                                on_saved=lambda saved: (self.refresh_profiles(select=saved), self._update_state()))
 
     def _update_state(self, *_):
-        notes, blocked, has_backup = [], self._busy, False
+        notes, blocked, namespace = [], self._busy, None
         if self.mode() == "custom":
             path, namespace = self.profile_combo.currentData(), self.ns_combo.currentData()
             if not path:
@@ -386,7 +388,8 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 blocked = True
             else:
                 try:
-                    info = generic.inspect(generic.load_profile(path), namespace)
+                    info = generic.inspect(generic.load_profile(path), namespace,
+                                           overwrite=self.overwrite_check.isChecked())
                     notes += info["issues"] + info["notes"]
                     blocked = blocked or bool(info["issues"])
                 except (OSError, ValueError, KeyError) as error:
@@ -401,8 +404,12 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 rig = adv.inspect_rig(main, overwrite=self.overwrite_check.isChecked())
                 notes += rig["issues"] + rig["notes"]
                 blocked = blocked or bool(rig["issues"])
-                has_backup = bool(adv.backups(rig["namespace"]))
-        self.restore_button.setEnabled(has_backup and not self._busy)
+                namespace = rig["namespace"] if cmds.objExists(main) else None
+        undo = self._undo_target(namespace)
+        if layers.detached_nodes():
+            notes.append("場景中有上次套用失敗時拆下、還沒接回的動畫（FlowHMR_detached_…），按右邊的按鈕可以接回。")
+        self.restore_button.setText(undo[0] if undo else "移除最新的 FlowHMR 動畫層")
+        self.restore_button.setEnabled(bool(undo) and not self._busy)
         unit = self.rate_combo.currentData()
         fps = timing_mod.unit_fps(unit) if unit else timing_mod.scene_fps()
         if not timing_mod.keeps_whole_frames(fps):
@@ -430,17 +437,11 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             folder = adv.staging_root() / f"{job['id']}_flowhmr_t"
             download = dict(profile="flowhmr", mesh=0, first_pose="t")
         else:
-            main = self.rig_combo.currentText()
-            overwrite = self.overwrite_check.isChecked()
-            animated = adv.animated_controls(adv.inspect_rig(main, overwrite=True)["namespace"]) if overwrite else []
-            if animated and not self._confirm(
-                    f"{main} 有 {len(animated)} 個控制器已經有動畫，將換成「{job['filename']}」的動作。\n\n"
-                    "原動畫會先備份在場景節點 FlowHMR_animBackup_… 裡，之後可以按「還原覆蓋前的動畫」找回；"
-                    "存檔後備份才會保存下來。套用本身不能用 Ctrl+Z 復原。\n\n要繼續嗎？"):
-                return
-            target = {"mode": "adv", "main": main, "overwrite": overwrite}
+            target = {"mode": "adv", "main": self.rig_combo.currentText()}
             folder = adv.staging_root() / job["id"]
             download = {}
+        target["overwrite"] = self.overwrite_check.isChecked()
+        target["label"] = Path(job.get("filename") or job["id"]).stem
         self._busy = True
         self._update_state()
         self.apply_button.setText("下載 FBX…")
@@ -456,19 +457,55 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def restore(self):
+    def _target_namespace(self):
+        if self.mode() == "custom":
+            return self.ns_combo.currentData()
         main = self.rig_combo.currentText()
-        if not main or self._busy:
+        return adv.inspect_rig(main, overwrite=True)["namespace"] if main and cmds.objExists(main) else None
+
+    def _undo_target(self, namespace):
+        """(button text, kind, node) for what the restore button would undo, or None."""
+        detached = layers.detached_nodes()
+        if detached:
+            return ("接回上次拆下的動畫", "detached", detached[-1])
+        if namespace is None:
+            return None
+        found = layers.flowhmr_layers(namespace)
+        if found:
+            return ("移除最新的 FlowHMR 動畫層", "layer", found[-1])
+        if self.mode() == "adv":
+            nodes = adv.backups(namespace)
+            if nodes:
+                return ("還原舊版的覆蓋備份", "backup", nodes[-1])
+        return None
+
+    def restore(self):
+        if self._busy:
             return
-        namespace = adv.inspect_rig(main, overwrite=True)["namespace"]
-        nodes = adv.backups(namespace)
-        if not nodes or not self._confirm(
-                f"要刪除 {main} 目前的動畫，並還原備份 {nodes[-1]} 嗎？還原後這個備份節點會被刪除。"):
+        undo = self._undo_target(self._target_namespace())
+        if not undo:
+            return
+        _, kind, node = undo
+        if kind == "layer":
+            label = layers.layer_info(node).get("label", "")
+            text = (f"要刪除動畫層 {node}" + (f"（{label}）" if label else "") + " 嗎？\n\n"
+                    "rig 會回到下層的動畫，播放範圍回到套用前；幀率不會改回。")
+        elif kind == "detached":
+            text = f"要把 {node} 記錄的動畫接回控制器嗎？"
+        else:
+            text = f"要刪除目前的動畫，並還原舊版備份 {node} 嗎？還原後這個備份節點會被刪除。"
+        if not self._confirm(text):
             return
         try:
-            result = adv.restore_backup(nodes[-1])
-            self.log(f"已還原 {nodes[-1]}：{result['restored_curves']} 條曲線"
-                     + (f"，{result['missing']} 條找不到" if result["missing"] else "") + "。")
+            if kind == "layer":
+                result = layers.remove_layer(node)
+                self.log(f"已刪除動畫層 {node}（{result['curves']} 條曲線）。")
+            elif kind == "detached":
+                self.log(f"已接回 {layers.reattach(node)} 個通道的動畫。")
+            else:
+                result = adv.restore_backup(node)
+                self.log(f"已還原 {node}：{result['restored_curves']} 條曲線"
+                         + (f"，{result['missing']} 條找不到" if result["missing"] else "") + "。")
         except Exception as error:
             self.log(f"還原失敗：{error}")
             QtWidgets.QMessageBox.warning(self, "FlowHMR Bridge", str(error))
@@ -485,19 +522,20 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             QtWidgets.QApplication.processEvents()
             try:
                 if target["mode"] == "custom":
-                    result = generic.apply(target["namespace"], target["profile"], data, target_unit=unit, log=self.log)
+                    result = generic.apply(target["namespace"], target["profile"], data, target_unit=unit,
+                                           log=self.log, overwrite=target["overwrite"], label=target["label"])
                 else:
                     result = adv.apply(target["main"], data, target_unit=unit, log=self.log,
-                                       overwrite=target["overwrite"])
+                                       overwrite=target["overwrite"], label=target["label"])
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
             keys = result["keys"]
             first, last = keys["first"], keys["last"]
             self.log(f"完成：{result['driven_controls']} 個控制器、{keys['keys']} 個 key，{result['fps']:g} fps，"
                      f"範圍 {first:g}–{last:g}（{result['seconds']:.1f} 秒）。第 {first:g} 幀是 T Pose 參考。"
-                     "這次套用不能用 Ctrl+Z 復原（匯入 FBX 會清空 undo 紀錄）。")
-            if result.get("backup"):
-                self.log(f"原動畫備份在 {result['backup']}，要找回請按「還原覆蓋前的動畫」。")
+                     "這次套用不能用 Ctrl+Z 復原（匯入 FBX 會清空 undo 紀錄），要撤銷請刪除它的動畫層。")
+            if result.get("layer"):
+                self.log(f"動作在動畫層 {result['layer']}；要回到原本的動畫，把它靜音，或按「移除最新的 FlowHMR 動畫層」。")
             if result.get("skipped_controls"):
                 self.log(f"略過 {len(result['skipped_controls'])} 個被 rig 內部驅動的控制器。")
             for note in result.get("notes", []):

@@ -1,10 +1,11 @@
 """Retarget a FlowHMR ``flowhmr``-profile FBX onto any rig's controls from a mapping profile.
 
-Stage 1: FK chains + root, no IK. The core step is rest calibration: at the source's
-T-pose frame (-1 at 30 FPS) each mapped source joint is rotated so that its bone points
-the same way as the matching control chain on the rig at rest. Orient constraints with
-maintained offsets then pass the source's world-space rotation changes to the controls,
-so the rig's bones follow the source bones' directions whatever the rig's rest pose is.
+The core step is rest calibration: at the source's T-pose frame (-1 at 30 FPS) each mapped
+limb and finger joint is rotated so that its bone points the same way as the matching control
+chain on the rig at rest. Orient constraints with maintained offsets then pass the source's
+world-space rotation changes to the controls, so arms, legs and fingers follow the source
+bones' directions whatever the rig's rest pose is (T or A). Bones in KEEP_REST are not
+aligned: they keep the rig's own rest pose and take only the source's rotation change.
 
 Profile (JSON), names without namespace; "{s}" / "{Side}" expand per entry in "sides":
     {"name": "...", "rest": "zero" | "current",
@@ -26,6 +27,7 @@ import maya.api.OpenMaya as om
 import maya.cmds as cmds
 import maya.mel as mel
 
+from . import layers
 from . import timing as timing_mod
 from .adv import ApplyError, count_flips
 from .mapping import _expand_text, expand, expand_ik, switch_holds  # noqa: F401  (re-exported for callers)
@@ -34,6 +36,13 @@ SOURCE_NS = "FlowHMRSrc"
 TAG = "flowhmrGenericCN"
 PROFILE_DIR = Path(__file__).resolve().parent / "profiles"
 TEST_ONLY = {"adv_generic_test"}  # FK-only ADV profile used to test the engine; ADV rigs use MoCapLibrary
+# Source bones whose rest direction differs between skeletons because the joints sit in different
+# places (collar vs shoulder blade, ankle height above the ball, spine curve, head joint height),
+# not because the rest pose differs: both skeletons stand upright with flat feet and relaxed
+# shoulders. Aligning their directions turns that placement difference into a pose change
+# (shrugged shoulders, feet tilted 35 degrees, a bent neck), so they map rest to rest instead.
+KEEP_REST = frozenset({"Hips", "Spine", "Spine1", "Spine2", "Spine3", "Neck", "Head",
+                       "LeftShoulder", "RightShoulder", "LeftFoot", "RightFoot", "LeftToeBase", "RightToeBase"})
 
 
 # ------------------------------------------------------------------ profiles
@@ -41,28 +50,57 @@ def user_profile_dir():
     return Path(cmds.internalVar(userAppDir=True)) / "FlowHMRBridge" / "profiles"
 
 
+def user_preset_dir():
+    """Imported presets: read-only like the shipped templates; edits are saved as a new profile."""
+    return Path(cmds.internalVar(userAppDir=True)) / "FlowHMRBridge" / "presets"
+
+
+def is_preset(path):
+    """Shipped template or imported preset: never overwritten by the editor."""
+    try:
+        parent = Path(path).resolve().parent
+    except OSError:
+        return False
+    return parent in (PROFILE_DIR.resolve(), user_preset_dir().resolve())
+
+
 def list_profiles():
-    """[(display name, path, builtin)] — the user's own profiles first, then the shipped ones."""
+    """[(display name, path, read_only)] — the user's own profiles, then imported presets,
+    then the shipped templates."""
     found = []
-    for folder, builtin in ((user_profile_dir(), False), (PROFILE_DIR, True)):
+    for folder, suffix in ((user_profile_dir(), ""), (user_preset_dir(), "（preset）"), (PROFILE_DIR, "（內建範本）")):
         if not folder.is_dir():
             continue
         for path in sorted(folder.glob("*.json")):
-            if builtin and path.stem in TEST_ONLY:
+            if folder == PROFILE_DIR and path.stem in TEST_ONLY:
                 continue
             try:
                 name = json.loads(path.read_text(encoding="utf-8")).get("name") or path.stem
             except (OSError, ValueError):
                 continue
-            found.append((name + ("（內建範本）" if builtin else ""), path, builtin))
+            found.append((name + suffix, path, bool(suffix)))
     return found
+
+
+def import_preset(source):
+    """Copy a profile file into the preset folder (checked first). Returns the new path."""
+    source = Path(source)
+    profile = json.loads(source.read_text(encoding="utf-8"))
+    expand(profile)  # raises on a file that is not a mapping profile
+    folder = user_preset_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    target, index = folder / source.name, 2
+    while target.exists():
+        target, index = folder / f"{source.stem}_{index}{source.suffix}", index + 1
+    target.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
 
 
 def load_profile(name_or_path):
     path = Path(name_or_path)
     if not path.suffix:
-        user = user_profile_dir() / f"{name_or_path}.json"
-        path = user if user.is_file() else PROFILE_DIR / f"{name_or_path}.json"
+        candidates = [folder / f"{name_or_path}.json" for folder in (user_profile_dir(), user_preset_dir(), PROFILE_DIR)]
+        path = next((c for c in candidates if c.is_file()), candidates[-1])
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -92,7 +130,16 @@ def control_kinds(profile):
     return kinds
 
 
-def inspect(profile, namespace):
+def bake_channels(profile, namespace):
+    """Channels FlowHMR bakes or holds: translate/rotate of every mapped control and the switches.
+    Other keyed attributes (space switches...) stay connected, so the bake sees the rig as animated."""
+    _, _, hold = expand(profile)
+    hold.update(switch_holds(profile))
+    plugs = [p for c in mapped_controls(profile, namespace) for p in _plugs(c, "parent")]
+    return plugs + [namespace + plug for plug in hold]
+
+
+def inspect(profile, namespace, overwrite=False):
     """Issues that block applying and notes worth showing, like adv.inspect_rig."""
     kinds = control_kinds(profile)
     wanted = {namespace + c for c in kinds}
@@ -101,10 +148,12 @@ def inspect(profile, namespace):
     if not controls:
         issues.append("設定檔裡的控制器在這個 namespace 都找不到。")
         return {"controls": controls, "issues": issues, "notes": notes}
-    animated = _animated(controls)
-    if animated:
-        issues.append(f"有 {len(animated)} 個對應的控制器已經有動畫（例如 {', '.join(a.split(':')[-1] for a in animated[:3])}）。"
-                      "自訂模式還不支援覆蓋，請在沒有動畫的場景或副本裡套用。")
+    animated = layers.Channels(bake_channels(profile, namespace)).animated
+    if animated and not overwrite:
+        issues.append(f"有 {len(animated)} 個控制器已經有動畫（例如 {', '.join(a.split(':')[-1] for a in animated[:3])}）。"
+                      "要疊上 FlowHMR 的動作，請勾選「rig 已有動畫時也套用」。")
+    elif animated:
+        notes.append(f"{len(animated)} 個控制器已經有動畫：FlowHMR 的動作會放在新的動畫層，原動畫保留在下層。")
     missing = sorted(wanted - set(controls))
     if missing:
         notes.append(f"{len(missing)} 個控制器在場景中找不到，會略過：{', '.join(m.split(':')[-1] for m in missing[:4])}")
@@ -274,12 +323,17 @@ def _leg_length(points):
     return sum((b - a).length() for a, b in zip(points, points[1:]))
 
 
+def _depth(node):
+    return len((cmds.ls(node, long=True) or [node])[0].split("|"))
+
+
 def calibrate(profile, namespace, top, frame=-1):
-    """Scale the source to the rig's leg length, then align each mapped bone direction.
-    Returns per-link residual angles (degrees) after alignment."""
+    """Scale the source to the rig's leg length, then align each mapped limb/finger bone direction.
+    Returns per-link residual angles (degrees) after alignment, and the KEEP_REST bones whose
+    rotation had to be put back after their ancestors were aligned."""
     _, chains, _ = expand(profile)
     cmds.currentTime(frame, edit=True)
-    report = {"scale": 1.0, "aligned": {}, "skipped": []}
+    report = {"scale": 1.0, "aligned": {}, "skipped": [], "kept": [], "restored": []}
 
     target = current = None
     legs = next((c for c in chains if c["name"].startswith("leg")), None)
@@ -302,6 +356,9 @@ def calibrate(profile, namespace, top, frame=-1):
         cmds.setAttr(top + ".scale", scale, scale, scale)
         report["scale"] = round(ratio, 4)
 
+    # World rotations of the rest-to-rest bones before anything moves: aligning a thigh and
+    # shin would otherwise tilt the foot below them, and the offset would be taken from that.
+    kept = {name: _world_quat(source(name)) for name in KEEP_REST if cmds.objExists(source(name))}
     for chain in chains:
         links = [(s, namespace + c) for s, c in chain["links"] if cmds.objExists(source(s)) and cmds.objExists(namespace + c)]
         targets = list(links)
@@ -309,11 +366,21 @@ def calibrate(profile, namespace, top, frame=-1):
             targets.append((chain["end_aim"][0], namespace + chain["end_aim"][1]))
         for index in range(chain["align_from"], len(targets) - 1):
             (joint, control), (child, child_control) = targets[index], targets[index + 1]
+            if joint in KEEP_REST:
+                if joint not in report["kept"]:
+                    report["kept"].append(joint)
+                continue
             residual = _rotate_towards(source(joint), source(child), _pivot(child_control) - _pivot(control), frame)
             if residual is None:
                 report["skipped"].append(joint)
             else:
                 report["aligned"][joint] = round(residual, 3)
+    # Parents first, so each restored bone is set against its parent's final rotation.
+    for name in sorted(kept, key=lambda n: _depth(source(n))):
+        turn = _world_quat(source(name)) * kept[name].inverse()
+        if math.degrees(2 * math.acos(min(1.0, abs(turn.w)))) > 1e-3:
+            _key_world_rotation(source(name), kept[name].asMatrix(), frame)
+            report["restored"].append(name)
     return report
 
 
@@ -393,13 +460,29 @@ def pole_locator(entry, namespace, frames, rig_start=None, ratio=1.0):
     return locator
 
 
-def _rig_start(profile, namespace, entry):
-    """The rig control at the limb's root (upper arm / thigh), if the FK chain is mapped."""
+def _rig_fk(profile, namespace, joint):
+    """The FK control mapped to a source joint, if it exists in the scene."""
     for chain in expand(profile)[1]:
-        for joint, control in chain["links"]:
-            if joint == entry["start"] and cmds.objExists(namespace + control):
+        for source_joint, control in chain["links"]:
+            if source_joint == joint and cmds.objExists(namespace + control):
                 return namespace + control
     return None
+
+
+def _rig_start(profile, namespace, entry):
+    """The rig control at the limb's root (upper arm / thigh), if the FK chain is mapped."""
+    return _rig_fk(profile, namespace, entry["start"])
+
+
+def _fk_end(profile, namespace, entry):
+    """For arms with the whole FK chain mapped: the FK wrist control. The IK wrist then sits
+    where the FK chain puts the wrist, so the IK arm bends exactly like the FK arm even when the
+    rig's upper arm / forearm proportions differ from the source's. Legs keep the reach target,
+    which keeps planted feet planted."""
+    if not entry["end"].endswith("Hand"):
+        return None
+    chain = [_rig_fk(profile, namespace, entry[key]) for key in ("start", "mid", "end")]
+    return chain[2] if all(chain) else None
 
 
 def limb_ratio(entry, rig_start, control):
@@ -413,7 +496,8 @@ def limb_ratio(entry, rig_start, control):
 def to_rig_space(point, entry, rig_start, ratio, label):
     """A transform at rig limb root + (source point - source limb root) * ratio, evaluated live.
 
-    The IK end and the pole both go through this, so the hand/foot keeps the source's reach for
+    The IK foot (and an IK hand without a full FK arm, see _fk_end) and the pole go through this,
+    so the hand/foot keeps the source's reach for
     the rig's own limb length wherever the rig's shoulder/hip is, and the pole stays in the plane
     the rig's limb actually bends in. (A fixed offset in the source hand's frame would swing
     around whenever the hand turns.)
@@ -486,8 +570,15 @@ def connect(profile, namespace, frames=None):
             else:
                 plugs += _channels(control, "parent")
                 if not locked_t:
-                    tip = to_rig_space(source(entry["end"]), entry, rig_start, ratio, "reach")
-                    tag(cmds.pointConstraint(tip, control, maintainOffset=True, skip=skip_t)[0])
+                    fk_end = _fk_end(profile, namespace, entry)
+                    if fk_end:
+                        # Translation only; the offset lives in the FK wrist's space, so an IK
+                        # control whose pivot is off the wrist still turns with the hand.
+                        tag(cmds.parentConstraint(fk_end, control, maintainOffset=True, skipTranslate=skip_t,
+                                                  skipRotate=["x", "y", "z"])[0])
+                    else:
+                        tip = to_rig_space(source(entry["end"]), entry, rig_start, ratio, "reach")
+                        tag(cmds.pointConstraint(tip, control, maintainOffset=True, skip=skip_t)[0])
                 if not locked_r:
                     tag(cmds.orientConstraint(source(entry["end"]), control, maintainOffset=True, skip=skip_r)[0])
                 kinds[control] = "parent"
@@ -542,9 +633,12 @@ def key_report(controls):
             "first": min(times) if times else None, "last": max(times) if times else None}
 
 
-def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connected=None, on_baked=None):
+def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connected=None, on_baked=None,
+          overwrite=False, label=None):
     """Retarget ``fbx`` (FlowHMR ``flowhmr`` profile, T pose at frame -1) onto the rig in
-    ``main_namespace`` ("" or "Ns:") using ``profile``. Returns a summary dict."""
+    ``main_namespace`` ("" or "Ns:") using ``profile``. The result goes on a new override
+    animation layer; the rig's own animation stays underneath (``overwrite`` must be True when
+    the rig already has some). Returns a summary dict."""
     started = time.time()
     if isinstance(profile, (str, Path)):
         profile = load_profile(profile)
@@ -552,18 +646,26 @@ def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connecte
     controls = mapped_controls(profile, namespace)
     if not controls:
         raise ApplyError("設定檔裡的控制器在場景中都找不到。")
-    animated = _animated(controls)
-    if animated:
-        raise ApplyError(f"有 {len(animated)} 個對應的控制器已經有動畫（例如 {', '.join(animated[:3])}）。")
     _, _, hold = expand(profile)
     hold.update(switch_holds(profile))  # each limb's FK/IK switch, set to the chosen mode
-    rest_plugs = [p for c in controls for p in _channels(c, "parent")] if profile.get("rest", "zero") == "zero" else []
-    saved = _remember(rest_plugs + [namespace + plug for plug in hold])
+    holds = {namespace + plug: value for plug, value in hold.items()}
+    label = label or Path(fbx).stem.replace("_flowhmr", "")
+    channels = layers.Channels(bake_channels(profile, namespace), label=label)
+    if channels.animated and not overwrite:
+        raise ApplyError(f"有 {len(channels.animated)} 個控制器已經有動畫（例如 {', '.join(channels.animated[:3])}）。"
+                         "要疊上 FlowHMR 的動作，請勾選「rig 已有動畫時也套用」。")
     timing = timing_mod.Timing()
     target = target_unit or timing.unit
+    previous_range = layers.range_seconds()
     curves_before = set(cmds.ls(type="animCurve"))
+    layer = None
     log(f"通用引擎：{profile.get('name', '?')} → {namespace or '(無 namespace)'}，{len(controls)} 個控制器")
+    if channels.animated:
+        log(f"{len(channels.animated)} 個控制器已有動畫：烘焙時先拆下，烘焙後放回動畫層下方。")
     try:
+        channels.free()
+        # after free(): _free() rejects keyed channels, so this must not run earlier
+        rest_plugs = [p for c in controls for p in _channels(c, "parent")] if profile.get("rest", "zero") == "zero" else []
         timing.prepare()
         top = import_source(fbx)
         timing.imported()
@@ -573,13 +675,14 @@ def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connecte
         start, end = min(source_keys), max(source_keys)
         cmds.playbackOptions(minTime=start, maxTime=end, animationStartTime=start, animationEndTime=end)
         cmds.currentTime(start, edit=True)
-        for plug, value in hold.items():
-            if _settable(namespace + plug):
-                cmds.setAttr(namespace + plug, value)
+        for plug, value in holds.items():
+            if _settable(plug):
+                cmds.setAttr(plug, value)
         for plug in rest_plugs:
             cmds.setAttr(plug, 0)
         calibration = calibrate(profile, namespace, top, frame=start)
-        log(f"校正：縮放 {calibration['scale']}，對齊 {len(calibration['aligned'])} 段骨頭")
+        log(f"校正：縮放 {calibration['scale']}，對齊 {len(calibration['aligned'])} 段四肢／手指骨頭，"
+            f"{len(calibration['kept'])} 段（鎖骨、脊椎、頭頸、腳掌）保留 rig 的靜置姿勢")
         frames = list(range(int(round(start)), int(round(end)) + 1))
         constraints, kinds, skipped, plugs = connect(profile, namespace, frames)
         log(f"已接上 {len(constraints)} 個控制器")
@@ -608,18 +711,25 @@ def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connecte
         log(f"烘焙完成（{time.time() - bake_started:.1f} 秒），修正 {flips} 條 euler 翻轉曲線")
         if on_baked:
             on_baked(namespace)
+        info = {"namespace": namespace, "mode": "custom", "profile": profile.get("name"), "label": label,
+                "created": time.time(), "range_seconds": previous_range}
+        layer, layer_curves, unheld = layers.to_layer(channels, plugs, holds, layers.layer_name(namespace, label), info, start)
+        log(f"已放進動畫層 {layer}（{len(layer_curves)} 條曲線）。把這個動畫層靜音或刪除，就回到原本的動畫。")
+        if unheld:
+            log(f"{len(unheld)} 個屬性（例如 proxy 切換屬性）無法放進動畫層，已直接設成套用時的值：{', '.join(p.split(':')[-1] for p in unheld[:6])}")
         timing.finish(target)
-        keys = key_report(list(kinds))
+        keys = layers.key_report(layer_curves)
         cmds.currentTime(0, edit=True)
         return {"namespace": namespace, "profile": profile.get("name"), "driven_controls": len(kinds),
-                "skipped_controls": [c.split(":")[-1] for c in skipped],
+                "skipped_controls": [c.split(":")[-1] for c in skipped], "layer": layer,
                 "calibration": calibration, "source_frames": len(source_keys), "bake_range_30fps": (start, end),
                 "euler_flips_fixed": flips, "keys": keys, "time_unit": cmds.currentUnit(q=True, time=True),
                 "fps": timing_mod.scene_fps(), "seconds": round(time.time() - started, 2)}
     except Exception as error:
         problems = []
         for step in (lambda: cmds.delete(_constraints()) if _constraints() else None, remove_source,
-                     lambda: _remove_new_keys(controls, curves_before), lambda: _put_back(saved), timing.abort):
+                     lambda: layers.remove_layer(layer, restore_range=False) if layer and cmds.objExists(layer) else None,
+                     lambda: _remove_new_keys(controls, curves_before), channels.restore, timing.abort):
             try:
                 step()
             except Exception as cleanup_error:

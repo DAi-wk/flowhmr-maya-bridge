@@ -106,6 +106,9 @@ def sample(frames, with_source):
 
 
 def errors_vs_source(rows):
+    """Rig bone direction vs source bone direction. Only limb and finger bones are aligned; a
+    segment that starts at a generic.KEEP_REST bone (spine, collar, foot) shows the rig's own
+    rest offset from the source here by design, not a retarget error."""
     rest, motion = {}, {}
     for frame, row in rows.items():
         for a, b in STATE["segments"]:
@@ -140,6 +143,10 @@ def drift(rows_a, rows_b):
 
 
 def clear_keys():
+    """Remove this rig's FlowHMR layers (each apply bakes onto one), then any plain keys."""
+    from flowhmr_bridge import layers
+    for layer in reversed(layers.flowhmr_layers(STATE["ns"])):
+        layers.remove_layer(layer, restore_range=False)
     curves = set()
     for control in STATE["controls"]:
         for curve in cmds.listConnections(control, s=True, d=False, type="animCurve") or []:

@@ -336,7 +336,9 @@ def classify(name):
     if "foot" in words and fk is not None and side != "C":
         return ("toe", side, 3, None)  # mGear foot_L0_fk0 is the ball
     if "root" in words and side == "C":
-        return ("pelvis", side, 3, None) if "fk" in words else ("root", side, 2, None)
+        # ADV FKRoot_M bends the lower spine without moving the legs (RootX_M carries the hips),
+        # so it is the first spine bone, as in ADV's own MoCap mapping (FKRoot_M <- Spine).
+        return ("spine", side, 3, None) if "fk" in words else ("root", side, 2, None)
 
     best = None
     for position, token in enumerate(toks):
@@ -398,7 +400,9 @@ def automap(candidates):
         spine = fk_spine
     heights = [c["y"] for c in scored if c["kind"] in ("head",)] + [c["y"] for c in scored if c["kind"] in ("toe", "foot")]
     span = (max(heights) - min(heights)) if len(heights) > 1 else 1.0
-    hips_y = next((c["y"] for c in scored if c["name"] in (slots.get("pelvis"), slots.get("root"))), None)
+    # A spine control at hip height only follows the pelvis when the rig has its own pelvis
+    # control (Hive's ribbon base under hips_anim); otherwise it is the lower back (ADV FKRoot_M).
+    hips_y = next((c["y"] for c in scored if c["name"] == slots.get("pelvis")), None)
     if spine and hips_y is not None and spine[0]["y"] <= hips_y + 0.02 * span:
         slots["spine_base"] = spine.pop(0)["name"]
     if len(spine) > 3:
