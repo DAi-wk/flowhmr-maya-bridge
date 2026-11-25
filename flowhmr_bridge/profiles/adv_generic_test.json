@@ -1,0 +1,30 @@
+{
+  "name": "AdvancedSkeleton biped (generic engine test, FK)",
+  "rest": "zero",
+  "root": {"source": "Hips", "control": "RootX_M"},
+  "hold": {
+    "FKIKLeg_{s}.FKIKBlend": 0,
+    "FKIKArm_{s}.FKIKBlend": 0,
+    "FKIKSpine_M.FKIKBlend": 0
+  },
+  "sides": [["L", "Left"], ["R", "Right"]],
+  "chains": [
+    {"name": "spine", "align_from": 1,
+     "links": [["Hips", "FKRoot_M"], ["Spine1", "FKSpine1_M"], ["Spine2", "FKChest_M"], ["Neck", "FKNeck_M"], ["Head", "FKHead_M"]]},
+    {"name": "arm_{s}",
+     "links": [["{Side}Shoulder", "FKScapula_{s}"], ["{Side}Arm", "FKShoulder_{s}"], ["{Side}ForeArm", "FKElbow_{s}"], ["{Side}Hand", "FKWrist_{s}"]],
+     "end_aim": ["{Side}HandMiddle1", "FKMiddleFinger1_{s}"]},
+    {"name": "leg_{s}",
+     "links": [["{Side}UpLeg", "FKHip_{s}"], ["{Side}Leg", "FKKnee_{s}"], ["{Side}Foot", "FKAnkle_{s}"], ["{Side}ToeBase", "FKToes_{s}"]]},
+    {"name": "thumb_{s}",
+     "links": [["{Side}HandThumb1", "FKThumbFinger1_{s}"], ["{Side}HandThumb2", "FKThumbFinger2_{s}"], ["{Side}HandThumb3", "FKThumbFinger3_{s}"]]},
+    {"name": "index_{s}",
+     "links": [["{Side}HandIndex1", "FKIndexFinger1_{s}"], ["{Side}HandIndex2", "FKIndexFinger2_{s}"], ["{Side}HandIndex3", "FKIndexFinger3_{s}"]]},
+    {"name": "middle_{s}",
+     "links": [["{Side}HandMiddle1", "FKMiddleFinger1_{s}"], ["{Side}HandMiddle2", "FKMiddleFinger2_{s}"], ["{Side}HandMiddle3", "FKMiddleFinger3_{s}"]]},
+    {"name": "ring_{s}",
+     "links": [["{Side}HandRing1", "FKRingFinger1_{s}"], ["{Side}HandRing2", "FKRingFinger2_{s}"], ["{Side}HandRing3", "FKRingFinger3_{s}"]]},
+    {"name": "pinky_{s}",
+     "links": [["{Side}HandPinky1", "FKPinkyFinger1_{s}"], ["{Side}HandPinky2", "FKPinkyFinger2_{s}"], ["{Side}HandPinky3", "FKPinkyFinger3_{s}"]]}
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "name": "Zoo Hive biped (_C_ centre controls, FK)",
+  "notes": "Body and limbs only. Fingers are not mapped because the Hive rig this was tested on drives its fingers through a custom finger IK layer above the Hive finger controls; add them in the mapping editor if your rig uses plain Hive FK fingers.",
+  "rest": "zero",
+  "root": {"source": "Hips", "control": "spine_C_cog_anim"},
+  "hold": {
+    "arm_{s}_shldr_fk_anim.ikfk": 1,
+    "leg_{s}_upr_fk_anim.ikfk": 1
+  },
+  "sides": [["L", "Left"], ["R", "Right"]],
+  "chains": [
+    {"name": "pelvis", "links": [["Hips", "spine_C_hips_anim"]]},
+    {"name": "spine", "align_from": 1,
+     "links": [["Hips", "spine_C_ctrl00_anim"], ["Spine1", "spine_C_ctrl01_anim"], ["Spine2", "spine_C_ctrl02_anim"],
+               ["Neck", "head_C_neck_anim"], ["Head", "head_C_head_anim"]]},
+    {"name": "arm_{s}",
+     "links": [["{Side}Shoulder", "clavicle_{s}_00_anim"], ["{Side}Arm", "arm_{s}_shldr_fk_anim"],
+               ["{Side}ForeArm", "arm_{s}_elbow_fk_anim"], ["{Side}Hand", "arm_{s}_wrist_fk_anim"]],
+     "end_aim": ["{Side}HandMiddle1", "finger_middle_{s}_01_anim"]},
+    {"name": "leg_{s}",
+     "links": [["{Side}UpLeg", "leg_{s}_upr_fk_anim"], ["{Side}Leg", "leg_{s}_knee_fk_anim"],
+               ["{Side}Foot", "leg_{s}_foot_fk_anim"], ["{Side}ToeBase", "leg_{s}_ball_fk_anim"]]}
+  ],
+  "test": {
+    "pairs": {
+      "spine_00_jnt": "Hips", "spine_05_jnt": "Spine2", "neck_jnt": "Neck", "head_jnt": "Head",
+      "clavicle_{s}_00_jnt": "{Side}Shoulder", "arm_{s}_shldr_jnt": "{Side}Arm", "arm_{s}_elbow_jnt": "{Side}ForeArm",
+      "arm_{s}_wrist_jnt": "{Side}Hand", "leg_{s}_upr_jnt": "{Side}UpLeg", "leg_{s}_knee_jnt": "{Side}Leg",
+      "leg_{s}_foot_jnt": "{Side}Foot", "leg_{s}_ball_jnt": "{Side}ToeBase",
+      "finger_middle_{s}_01_jnt": "{Side}HandMiddle1"
+    },
+    "segments": [
+      ["spine_00_jnt", "spine_05_jnt"], ["spine_05_jnt", "neck_jnt"], ["neck_jnt", "head_jnt"],
+      ["clavicle_{s}_00_jnt", "arm_{s}_shldr_jnt"], ["arm_{s}_shldr_jnt", "arm_{s}_elbow_jnt"],
+      ["arm_{s}_elbow_jnt", "arm_{s}_wrist_jnt"], ["arm_{s}_wrist_jnt", "finger_middle_{s}_01_jnt"],
+      ["leg_{s}_upr_jnt", "leg_{s}_knee_jnt"], ["leg_{s}_knee_jnt", "leg_{s}_foot_jnt"],
+      ["leg_{s}_foot_jnt", "leg_{s}_ball_jnt"]
+    ],
+    "arm_rest_controls": {"L": "arm_L_shldr_fk_anim", "R": "arm_R_shldr_fk_anim"},
+    "fit": ["spine_C_cog_anim", "head_C_head_anim", "leg_L_foot_fk_anim", "leg_R_foot_fk_anim",
+            "arm_L_wrist_fk_anim", "arm_R_wrist_fk_anim"]
+  }
+}

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+staging/
+*_report*.json
+*.fbx
+.vscode/
+.idea/
