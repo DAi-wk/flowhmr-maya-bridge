@@ -10,10 +10,14 @@ Two workarounds depend on ADV 6.755 internals (see _panel_namespace and _connect
 from __future__ import annotations
 
 import json
+import math
+import re
 import shutil
 import time
+import traceback
 from pathlib import Path
 
+import maya.api.OpenMaya as om
 import maya.cmds as cmds
 import maya.mel as mel
 
@@ -35,6 +39,37 @@ BODY_DRIVEN = ("RootX_M", "FKRoot_M", "FKSpine1_M", "FKChest_M", "FKNeck_M", "FK
         "FKHip", "FKKnee", "FKAnkle", "FKToes", "IKLeg", "PoleLeg", "IKToes",
         "FKScapula", "FKShoulder", "FKElbow", "FKWrist"))
 FINGERS = ("Thumb", "Index", "Middle", "Ring", "Pinky")
+# asMCLConnectBody ties these with -mo at frame -1, so right after it they must still sit
+# exactly where the build pose put them. A bad scene state once gave FKSpine1_M a ~130 deg
+# offset there, which baked a folded-over body without any error.
+CONNECT_CHECK = ("RootX_M", "FKRoot_M", "FKSpine1_M", "FKChest_M", "FKNeck_M", "FKHead_M")
+CONNECT_TOLERANCE = 5.0
+
+
+def _world_rotations(namespace, names):
+    found = {}
+    for name in names:
+        node = namespace + name
+        if cmds.objExists(node):
+            matrix = om.MMatrix(cmds.xform(node, q=True, ws=True, matrix=True))
+            found[name] = om.MTransformationMatrix(matrix).rotation(asQuaternion=True)
+    return found
+
+
+def _connect_offsets(namespace, before):
+    """Degrees each checked control moved at frame -1 between the build pose and ADV's connection."""
+    previous = cmds.currentTime(q=True)
+    cmds.currentTime(-1, edit=True, update=True)
+    try:
+        after = _world_rotations(namespace, before)
+    finally:
+        cmds.currentTime(previous, edit=True)
+    offsets = {}
+    for name, q in before.items():
+        if name in after:
+            d = q * after[name].inverse()
+            offsets[name] = math.degrees(2 * math.acos(min(1.0, abs(d.w))))
+    return offsets
 
 
 class ApplyError(RuntimeError):
@@ -284,6 +319,56 @@ def restore_backup(node):
     return {"restored_curves": restored, "missing": missing, "removed_flowhmr_curves": len(current)}
 
 
+# ------------------------------------------------------------------ build pose
+BUILD_POSE_ATTRS = ("udAttr", "udExtraAttr")
+RESET_PREFIXES = ("translate", "rotate", "scale")
+
+
+def build_pose_names(namespace):
+    """Node names (no namespace) ADV's build pose record mentions; None when there is no record."""
+    node = namespace + "buildPose"
+    texts = [cmds.getAttr(f"{node}.{attr}") or "" for attr in BUILD_POSE_ATTRS if cmds.objExists(f"{node}.{attr}")]
+    if not texts:
+        return None
+    return {name.rpartition(":")[2] for name in re.findall(r"[A-Za-z_][\w:]*", ";".join(texts))}
+
+
+def reset_unrecorded(namespace):
+    """Put the free translate/rotate/scale channels of ControlSet members the build pose record
+    leaves out back to their defaults. asGoToBuildPose does not touch such a control (a root
+    control added after the record was made, say), so once its animation is detached it keeps
+    the value it last evaluated to, e.g. the first frame of an earlier FlowHMR layer. Returns the
+    controls that were reset."""
+    recorded = build_pose_names(namespace)
+    if recorded is None:
+        return []
+    reset = []
+    for member in cmds.sets(namespace + "ControlSet", q=True) or []:
+        short = member.split("|")[-1].rpartition(":")[2]
+        if short in recorded:
+            continue
+        changed = False
+        for attr in cmds.listAttr(member, keyable=True, unlocked=True) or []:
+            plug = f"{member}.{attr}"
+            if not attr.startswith(RESET_PREFIXES) or cmds.connectionInfo(plug, isDestination=True) \
+                    or not cmds.getAttr(plug, settable=True):
+                continue
+            default = (cmds.attributeQuery(attr, node=member, listDefault=True) or [None])[0]
+            if isinstance(default, (int, float)) and abs(cmds.getAttr(plug) - default) > 1e-9:
+                cmds.setAttr(plug, default)
+                changed = True
+        if changed:
+            reset.append(short)
+    return reset
+
+
+def go_to_build_pose(main, namespace):
+    """ADV's build pose, plus the controls its record leaves out (see reset_unrecorded)."""
+    cmds.select(main, replace=True)
+    mel.eval('asGoToBuildPose ""')
+    return reset_unrecorded(namespace)
+
+
 # ------------------------------------------------------------------ helpers
 def staging_root():
     return Path(cmds.internalVar(userAppDir=True)) / "FlowHMRBridge" / "staging"
@@ -406,7 +491,9 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
     previous_option = cmds.optionVar(q=OPTION_VAR) if cmds.optionVar(exists=OPTION_VAR) else None
     log(f"套用 {fbx.name} → {main}")
     label = label or fbx.stem.replace("_maya_adv", "")
-    channels = layers.Channels(controlset_plugs(namespace), label=label)
+    recorded = controlset_plugs(namespace)
+    prior, prior_animated = layers.underneath(namespace, recorded, layers.sample_times())
+    channels = layers.Channels(recorded + list(prior), label=label)
     previous_range = layers.range_seconds()
     layer = None
     if channels.animated:
@@ -417,8 +504,12 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
         timing.prepare()
         cmds.currentTime(-1, edit=True)
         if build_pose:
-            cmds.select(main, replace=True)
-            mel.eval('asGoToBuildPose ""')
+            reset = go_to_build_pose(main, namespace)
+            if reset:
+                log(f"ADV 的 build pose 沒有記錄 {len(reset)} 個控制器，已一併歸零：{', '.join(reset[:6])}")
+        layers.put(prior)  # what earlier FlowHMR layers changed outside the ControlSet (layers.underneath)
+        for line in layers.describe_underneath(prior, prior_animated):
+            log(line)
         cmds.optionVar(sv=(OPTION_VAR, fbx.parent.as_posix()))
         mel.eval('asMoCapLibraryUI ""')
         labels = [cmds.menuItem(item, q=True, label=True) for item in cmds.optionMenu(MENU, q=True, itemListLong=True) or []]
@@ -426,9 +517,16 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
             raise ApplyError(f"ADV MoCapLibrary 沒有列出 {fbx.name}。")
         cmds.optionMenu(MENU, e=True, value=fbx.name)
         cmds.select(main, replace=True)
+        build_pose_rotations = _world_rotations(namespace, CONNECT_CHECK)  # at frame -1, after the build pose
         with _panel_namespace(namespace):
             mel.eval('asMCLApply "asPanel" Custom')
         timing.imported()
+        offsets = _connect_offsets(namespace, build_pose_rotations)
+        wrong = sorted(((angle, name) for name, angle in offsets.items() if angle > CONNECT_TOLERANCE), reverse=True)
+        if wrong:
+            raise ApplyError(
+                f"ADV 接上後，第 -1 幀的身體控制器偏離 build pose（{'、'.join(f'{n} {a:.0f}°' for a, n in wrong[:3])}），"
+                "烘焙會讓身體扭曲，已停止。場景可能殘留之前失敗的狀態：請存檔、重開 Maya 後再套用。")
         fingers = _connect_fingers(namespace)
         driven = _driven(_mocap_constraints())
         expected = [namespace + name for name in BODY_DRIVEN if cmds.objExists(namespace + name)]
@@ -487,6 +585,8 @@ def apply(main, fbx, target_unit=None, build_pose=True, log=print, on_connected=
                                                        cmds.playbackOptions(q=True, max=True)),
                 "notes": notes, "seconds": round(time.time() - started, 2)}
     except Exception as error:
+        if not isinstance(error, ApplyError):
+            traceback.print_exc()  # the Script Editor keeps the full cause; the panel only shows the message
         removed, problems = 0, []
         steps = [_remove_mocap,
                  lambda: layers.remove_layer(layer, restore_range=False) if layer and cmds.objExists(layer) else None,

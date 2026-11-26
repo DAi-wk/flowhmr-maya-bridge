@@ -56,11 +56,11 @@ class FlowHMRClient:
     def base_url(self):
         return f"http://127.0.0.1:{self.port}"
 
-    def _get(self, path, timeout=None):
-        request = urllib.request.Request(self.base_url + path, headers={"Accept": "application/json"})
+    def _response(self, path, timeout=None, method="GET"):
+        request = urllib.request.Request(self.base_url + path, method=method)
         try:
             with _OPENER.open(request, timeout=timeout or self.timeout) as response:
-                return response.read()
+                return response.headers, response.read()
         except urllib.error.HTTPError as error:
             detail = ""
             try:
@@ -70,6 +70,9 @@ class FlowHMRClient:
             raise FlowHMRError(f"FlowHMR HTTP {error.code} for {path}" + (f": {detail}" if detail else "")) from None
         except (urllib.error.URLError, OSError, ValueError) as error:
             raise FlowHMRError(f"FlowHMR is not reachable at {self.base_url} ({error})") from None
+
+    def _get(self, path, timeout=None):
+        return self._response(path, timeout)[1]
 
     def _json(self, path, timeout=None):
         try:
@@ -103,6 +106,39 @@ class FlowHMRClient:
             return self._get(f"/api/jobs/{_safe_id(job_id)}/thumbnail.jpg", timeout=5)
         except FlowHMRError:
             return None
+
+    def preview_source(self, job_id, use_character=True):
+        """The same SMPL-H stream and saved single-actor assignment as the character viewer."""
+        job_id = _safe_id(job_id)
+        headers, data = self._response(f"/api/jobs/{job_id}/pmx-motion", timeout=120)
+        try:
+            meta = json.loads(headers["X-FlowHMR-PMX-Motion"])
+            frames = meta["frames"]
+            if type(frames) is not int or frames < 1:
+                raise ValueError
+            floats = 156 + frames * (156 + 208 + 4 + (4 if meta.get("hasSoles") else 0))
+            if len(data) != 4 * floats:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise FlowHMRError("原始動作的標頭、幀數或資料長度不一致。") from None
+        result = dict(root=self.root, meta=meta, data=data, model=None, offsets=None)
+        if not use_character:
+            return result
+        catalog = self._json(f"/api/character-library?actor={job_id}")
+        actor = catalog["actors"].get(job_id)
+        saved = catalog["defaults"].get("single", {}) if actor is None else actor
+        identifier = saved.get("id")
+        if identifier:
+            model = next((m for m in catalog["models"] if m["id"] == identifier), None)
+            if not model or model["kind"] != "fbx":
+                raise FlowHMRError("這個任務指定的預覽角色無法用於 ADV。請選用同一個 rig 的蒙皮角色，或取消「使用 HMR 已儲存的角色設定」。")
+            # Opening a library model only issues a local read ticket. It does not change the assignment.
+            path = f"/api/character-library/{urllib.parse.quote(identifier, safe='')}/open"
+            ticket = json.loads(self._response(path, method="POST")[1])["ticket"]
+            offsets = actor.get("poses", {}).get(identifier) if actor is not None else saved.get("offsets")
+            result.update(model=self._get("/api/character-resource/" + urllib.parse.quote(ticket, safe=""), timeout=120),
+                          model_name=model["filename"], offsets=offsets)
+        return result
 
     def download_fbx(self, job_id, folder, profile="maya_adv", timeout=600, **params):
         """Write the job's FBX as the only file in ``folder`` (ADV lists the folder).

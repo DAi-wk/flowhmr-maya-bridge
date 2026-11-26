@@ -53,6 +53,8 @@ def resolve(plug):
     seen = set()
     while plug not in seen and cmds.objExists(plug):
         seen.add(plug)
+        if not cmds.listAttr(plug, userDefined=True):
+            return plug  # Maya reports a script error when addAttr queries a built-in channel.
         try:
             proxy = cmds.addAttr(plug, q=True, usedAsProxy=True)
         except RuntimeError:  # not a dynamic attribute
@@ -240,6 +242,95 @@ def flowhmr_layers(namespace=None):
             if namespace is None or info.get("namespace") == namespace:
                 found.append((info.get("created", 0), layer))
     return [layer for _, layer in sorted(found)]
+
+
+def _plug_key(plug):
+    """One spelling per plug: the node's shortest unique name and the attribute's long name."""
+    node, _, attr = plug.partition(".")
+    nodes = cmds.ls(node) or []
+    if len(nodes) != 1:
+        return plug
+    try:
+        attr = cmds.attributeName(plug, long=True)
+    except RuntimeError:
+        pass
+    return f"{nodes[0]}.{attr}"
+
+
+def sample_times():
+    """Start, middle and end of the current playback range (current time unit)."""
+    start, end = cmds.playbackOptions(q=True, min=True), cmds.playbackOptions(q=True, max=True)
+    return start, (start + end) / 2.0, end
+
+
+def underneath(namespace, recorded, times):
+    """What earlier FlowHMR layers of this rig hold that the coming apply does not record itself,
+    and what those channels are worth without any FlowHMR layer.
+
+    A new apply covers only its own channels. Anything else an earlier FlowHMR layer set (the raw
+    mode's spine ``bias``, its neck twist multipliers and Micro control keys, say) would still act
+    under the new layer and change its bake. The apply records these channels too, sets them to the
+    value they have with every FlowHMR layer of the rig muted, and holds that on its own layer, so
+    stacking gives the same result as applying to the rig alone; muting the new layer brings the
+    earlier layer back. Returns ({plug: value}, [plugs left alone because they are animated
+    underneath, over ``times``])."""
+    found = flowhmr_layers(namespace)
+    if not found:
+        return {}, []
+    own = {_plug_key(resolve(plug)) for plug in recorded if cmds.objExists(plug)}
+    plugs = []
+    for layer in found:
+        for plug in cmds.animLayer(layer, q=True, attribute=True) or []:
+            if not cmds.objExists(plug):
+                continue
+            key = _plug_key(resolve(plug))
+            if key in own or key in plugs or not cmds.objExists(key) or cmds.getAttr(key, lock=True):
+                continue
+            plugs.append(key)
+    if not plugs:
+        return {}, []
+    muted = {layer: cmds.animLayer(layer, q=True, mute=True) for layer in found}
+    values, animated = {}, []
+    try:
+        for layer in found:
+            cmds.animLayer(layer, e=True, mute=True)
+        for plug in plugs:
+            try:
+                samples = [cmds.getAttr(plug, time=t) for t in times]
+            except (RuntimeError, ValueError):
+                continue
+            if not all(isinstance(v, (int, float)) for v in samples):
+                continue
+            if max(samples) - min(samples) > 1e-6:
+                animated.append(plug)
+            else:
+                values[plug] = samples[0]
+    finally:
+        for layer, state in muted.items():
+            cmds.animLayer(layer, e=True, mute=state)
+    return values, animated
+
+
+def put(values):
+    """Set recorded channels that Channels.free() has detached; skip what is still driven."""
+    for plug, value in values.items():
+        if cmds.objExists(plug) and not cmds.connectionInfo(plug, isDestination=True) \
+                and not cmds.getAttr(plug, lock=True):
+            cmds.setAttr(plug, value)
+
+
+def describe_underneath(values, animated):
+    """Log lines for underneath()."""
+    lines = []
+    if values:
+        names = ", ".join(plug.rpartition(":")[2] for plug in list(values)[:4])
+        lines.append(f"下層 FlowHMR 動畫層動到、這次沒有烘焙的 {len(values)} 個通道，改成沒有 FlowHMR 動畫層時的值"
+                     f"並放進這次的動畫層（例如 {names}）。")
+    if animated:
+        names = ", ".join(plug.rpartition(":")[2] for plug in animated[:4])
+        lines.append(f"{len(animated)} 個通道在 FlowHMR 動畫層下方有自己的動畫，沒有改動，下層 FlowHMR 動畫層的值仍會作用："
+                     f"{names}")
+    return lines
 
 
 def range_seconds():

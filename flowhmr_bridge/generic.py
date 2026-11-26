@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import traceback
 from pathlib import Path
 
 import maya.api.OpenMaya as om
@@ -650,7 +651,9 @@ def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connecte
     hold.update(switch_holds(profile))  # each limb's FK/IK switch, set to the chosen mode
     holds = {namespace + plug: value for plug, value in hold.items()}
     label = label or Path(fbx).stem.replace("_flowhmr", "")
-    channels = layers.Channels(bake_channels(profile, namespace), label=label)
+    recorded = bake_channels(profile, namespace)
+    prior, prior_animated = layers.underneath(namespace, recorded, layers.sample_times())
+    channels = layers.Channels(recorded + list(prior), label=label)
     if channels.animated and not overwrite:
         raise ApplyError(f"有 {len(channels.animated)} 個控制器已經有動畫（例如 {', '.join(channels.animated[:3])}）。"
                          "要疊上 FlowHMR 的動作，請勾選「rig 已有動畫時也套用」。")
@@ -680,6 +683,9 @@ def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connecte
                 cmds.setAttr(plug, value)
         for plug in rest_plugs:
             cmds.setAttr(plug, 0)
+        layers.put(prior)  # what earlier FlowHMR layers set on channels this profile does not drive
+        for line in layers.describe_underneath(prior, prior_animated):
+            log(line)
         calibration = calibrate(profile, namespace, top, frame=start)
         log(f"校正：縮放 {calibration['scale']}，對齊 {len(calibration['aligned'])} 段四肢／手指骨頭，"
             f"{len(calibration['kept'])} 段（鎖骨、脊椎、頭頸、腳掌）保留 rig 的靜置姿勢")
@@ -726,6 +732,8 @@ def apply(main_namespace, profile, fbx, target_unit=None, log=print, on_connecte
                 "euler_flips_fixed": flips, "keys": keys, "time_unit": cmds.currentUnit(q=True, time=True),
                 "fps": timing_mod.scene_fps(), "seconds": round(time.time() - started, 2)}
     except Exception as error:
+        if not isinstance(error, ApplyError):
+            traceback.print_exc()  # the Script Editor keeps the full cause; the panel only shows the message
         problems = []
         for step in (lambda: cmds.delete(_constraints()) if _constraints() else None, remove_source,
                      lambda: layers.remove_layer(layer, restore_range=False) if layer and cmds.objExists(layer) else None,

@@ -66,13 +66,14 @@ class Timing:
         self._pushed = False
         self._changed = False
 
-    def prepare(self):
-        if not cmds.pluginInfo("fbxmaya", q=True, loaded=True):
-            cmds.loadPlugin("fbxmaya", quiet=True)
-        mel.eval("FBXPushSettings;")
-        self._pushed = True
-        mel.eval("FBXImportResamplingRateSource -v File;")
-        mel.eval("FBXImportSetMayaFrameRate -v false;")
+    def prepare(self, import_fbx=True):
+        if import_fbx:
+            if not cmds.pluginInfo("fbxmaya", q=True, loaded=True):
+                cmds.loadPlugin("fbxmaya", quiet=True)
+            mel.eval("FBXPushSettings;")
+            self._pushed = True
+            mel.eval("FBXImportResamplingRateSource -v File;")
+            mel.eval("FBXImportSetMayaFrameRate -v false;")
         self._changed = True
         _set_unit(SOURCE_UNIT, self.timeline)
         cmds.playbackOptions(playbackSpeed=1.0, by=1.0)
