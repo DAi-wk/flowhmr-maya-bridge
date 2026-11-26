@@ -221,6 +221,10 @@ rig 已經有動畫時，要勾選 **rig 已有動畫時也套用**。套用時�
 
 測試不需要 Maya，任何 Python 3.7 以上都可以跑，包括 FlowHMR 附的 `runtime/python.exe`。`phase0_adv_test.py`、`stage*_generic_test.py` 要在 Maya 裡、拋棄式的場景中執行，會對 rig 套用和烘焙動畫。
 
+## 參與貢獻
+
+歡迎回報問題和開 PR，請先看 [CONTRIBUTING.md](CONTRIBUTING.md)（附英文版）。
+
 ## 授權
 
 MIT，見 [LICENSE](LICENSE)。FlowHMR、AdvancedSkeleton、Zoo Tools、mGear 各自依它們的授權條款，這個 repo 不包含它們的任何檔案。
