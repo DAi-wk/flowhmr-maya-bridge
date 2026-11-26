@@ -1,10 +1,12 @@
 """Dockable Maya panel: pick a finished FlowHMR job and apply it to a rig.
 
-Four modes:
+Five modes:
   原始動作          — the FlowHMR preview solver drives ADV from the job's SMPL-H samples
   AdvancedSkeleton — ADV's own MoCapLibrary (flowhmr_bridge.adv)
   自訂對應          — any rig through a mapping profile (flowhmr_bridge.generic), edited in
                       the separate mapping editor (flowhmr_bridge.mapping_ui)
+  自訂＋HMR 求解    — the same profile, but FlowHMR's preview solver runs on the rig's skin
+                      skeleton and the controls follow it (flowhmr_bridge.custom_preview)
   HMR 角色 FBX      — an ADV rig follows the character FBX FlowHMR's preview exported for that
                       rig's own skin skeleton (flowhmr_bridge.character); a local file, no download
 
@@ -26,7 +28,7 @@ try:
 except ImportError:  # Maya 2024 and earlier
     from PySide2 import QtCore, QtGui, QtWidgets
 
-from . import __version__, adv, character, generic, layers
+from . import __version__, adv, character, custom_preview, generic, layers
 from . import client as client_mod
 from . import timing as timing_mod
 
@@ -34,6 +36,9 @@ OPTION_ROOT = "flowhmrBridgeRoot"
 OPTION_MODE = "flowhmrBridgeMode"
 OPTION_PROFILE = "flowhmrBridgeProfile"
 OPTION_CHAR_DIR = "flowhmrBridgeCharacterDir"
+OPTION_REFINE = "flowhmrBridgeRefineSpread"
+CUSTOM_MODES = ("custom", "custom_hmr")
+PREVIEW_MODES = ("raw", "custom_hmr")  # read the job's SMPL-H stream and run FlowHMR's preview solver
 POLL_MS = 3000
 CHARACTER_HINT = ("在 FlowHMR 預覽裡，替這個人物套用 rig 自己的蒙皮 FBX 當角色並儲存重定向，"
                   "再按「匯出 FBX…」，格式選「目前角色 FBX」（不用勾「包含蒙皮網格」）。"
@@ -113,6 +118,7 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.mode_combo.addItem("原始動作 → ADV（HMR 預覽求解器）", "raw")
         self.mode_combo.addItem("AdvancedSkeleton（ADV 動捕庫）", "adv")
         self.mode_combo.addItem("自訂對應（任意 rig）", "custom")
+        self.mode_combo.addItem("自訂對應＋HMR 預覽求解（任意 rig）", "custom_hmr")
         self.mode_combo.addItem("HMR 角色 FBX（ADV rig，照 FlowHMR 預覽）", "character")
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(_option(OPTION_MODE, "raw"))))
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
@@ -132,13 +138,6 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         rig_row.addWidget(self.rig_combo, 1)
         rig_row.addWidget(rig_refresh)
         form.addRow("目標 rig", rig_row)
-        self.use_character = QtWidgets.QCheckBox("使用 HMR 已儲存的角色設定")
-        # On by default: HMR's saved joint mapping and 校正值 (joint and root offsets) are part of
-        # the preview; without them a tuned preview cannot be reproduced.
-        self.use_character.setChecked(True)
-        self.use_character.setToolTip("勾選時讀取 HMR 為這個人物儲存的角色、關節對應和校正值，結果和 HMR 預覽相同。"
-                                      "取消勾選時只讀原始動作，從場景中 ADV 的 build pose 建立對應，HMR 的校正值不會套用。")
-        form.addRow(self.use_character)
         layout.addWidget(self.adv_box)
 
         # custom mode
@@ -167,6 +166,23 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         ns_row.addWidget(ns_refresh)
         form.addRow("目標 namespace", ns_row)
         layout.addWidget(self.custom_box)
+
+        # preview-solver options (原始動作 and 自訂＋HMR 求解)
+        self.use_character = QtWidgets.QCheckBox("使用 HMR 已儲存的角色設定")
+        # On by default: HMR's saved joint mapping and 校正值 (joint and root offsets) are part of
+        # the preview; without them a tuned preview cannot be reproduced.
+        self.use_character.setChecked(True)
+        self.use_character.setToolTip("勾選時讀取 HMR 為這個人物儲存的角色、關節對應和校正值，結果和 HMR 預覽相同"
+                                      "（那個角色必須是這個 rig 的蒙皮 FBX）。取消勾選時只讀原始動作，"
+                                      "從場景中 rig 的 build pose 建立對應，HMR 的校正值不會套用。")
+        layout.addWidget(self.use_character)
+        self.refine_check = QtWidgets.QCheckBox("分散型控制器用數值求解（ribbon 脊椎等，較慢）")
+        self.refine_check.setChecked(bool(_option(OPTION_REFINE, 0)))
+        self.refine_check.setToolTip("一個控制器把旋轉分給好幾節關節時（例如 ribbon 脊椎），逐幀求解它的旋轉，讓那些關節整體盡量貼近 "
+                                     "HMR 預覽。每幀從不勾時的結果出發，只接受讓整體誤差變小的解，但個別關節仍可能變差。"
+                                     "每段動作多花 1–4 分鐘；只會用在探測結果是「分散」的控制器。")
+        self.refine_check.toggled.connect(lambda on: cmds.optionVar(iv=(OPTION_REFINE, int(on))))
+        layout.addWidget(self.refine_check)
 
         # character FBX mode (uses the ADV rig row above)
         self.char_box = QtWidgets.QWidget()
@@ -230,11 +246,13 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
     def _apply_mode_visibility(self):
         mode = self.mode()
-        self.adv_box.setVisible(mode != "custom")
-        self.use_character.setVisible(mode == "raw")
-        self.custom_box.setVisible(mode == "custom")
+        self.adv_box.setVisible(mode not in CUSTOM_MODES)
+        self.use_character.setVisible(mode in PREVIEW_MODES)
+        self.refine_check.setVisible(mode == "custom_hmr")
+        self.custom_box.setVisible(mode in CUSTOM_MODES)
         self.char_box.setVisible(mode == "character")
-        self.apply_button.setText({"custom": "套用到自訂 rig", "character": "用角色 FBX 套用到 ADV rig",
+        self.apply_button.setText({"custom": "套用到自訂 rig", "custom_hmr": "用 HMR 預覽求解套用到自訂 rig",
+                                   "character": "用角色 FBX 套用到 ADV rig",
                                    "raw": "用原始動作套用到 ADV rig"}.get(mode, "套用到 ADV rig"))
 
     def _mode_changed(self, *_):
@@ -457,7 +475,7 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
     def _update_state(self, *_):
         notes, blocked, namespace = [], self._busy, None
         self._suggest_character()  # picks up a newer export (重新整理 / selecting the job again)
-        if self.mode() == "custom":
+        if self.mode() in CUSTOM_MODES:
             path, namespace = self.profile_combo.currentData(), self.ns_combo.currentData()
             if not path:
                 notes.append("還沒有對應設定。按「新增…」建立一個。")
@@ -538,6 +556,10 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             target = {"mode": "custom", "profile": self.profile_combo.currentData(), "namespace": self.ns_combo.currentData()}
             folder = adv.staging_root() / f"{job['id']}_flowhmr_t"
             download = dict(profile="flowhmr", mesh=0, first_pose="t")
+        elif self.mode() == "custom_hmr":
+            target = {"mode": "custom_hmr", "profile": self.profile_combo.currentData(),
+                      "namespace": self.ns_combo.currentData(), "use_character": self.use_character.isChecked(),
+                      "refine": self.refine_check.isChecked()}
         elif self.mode() == "raw":
             target = {"mode": "raw", "main": self.rig_combo.currentText(), "use_character": self.use_character.isChecked()}
         else:
@@ -548,7 +570,7 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         target["label"] = Path(job.get("filename") or job["id"]).stem
         self._busy = True
         self._update_state()
-        raw = target["mode"] == "raw"
+        raw = target["mode"] in PREVIEW_MODES
         source_name = "原始動作與預覽設定" if raw else "FBX"
         self.apply_button.setText(f"讀取{source_name}…")
         client = self.client
@@ -568,7 +590,7 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         threading.Thread(target=work, daemon=True).start()
 
     def _target_namespace(self):
-        if self.mode() == "custom":
+        if self.mode() in CUSTOM_MODES:
             return self.ns_combo.currentData()
         main = self.rig_combo.currentText()
         return adv.inspect_rig(main, overwrite=True)["namespace"] if main and cmds.objExists(main) else None
@@ -634,6 +656,10 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 if target["mode"] == "custom":
                     result = generic.apply(target["namespace"], target["profile"], data, target_unit=unit,
                                            log=self.log, overwrite=target["overwrite"], label=target["label"])
+                elif target["mode"] == "custom_hmr":
+                    result = custom_preview.apply(target["namespace"], target["profile"], data, target_unit=unit,
+                                                  log=self.log, overwrite=target["overwrite"], label=target["label"],
+                                                  refine=target["refine"])
                 elif target["mode"] == "character":
                     result = character.apply(target["main"], data, target_unit=unit, log=self.log,
                                              overwrite=target["overwrite"], label=target["label"])
@@ -647,7 +673,7 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 QtWidgets.QApplication.restoreOverrideCursor()
             keys = result["keys"]
             first, last = keys["first"], keys["last"]
-            reference = "" if target["mode"] in ("raw", "character") else f"第 {first:g} 幀是 T Pose 參考。"
+            reference = "" if target["mode"] in ("raw", "character", "custom_hmr") else f"第 {first:g} 幀是 T Pose 參考。"
             self.log(f"完成：{result['driven_controls']} 個控制器、{keys['keys']} 個 key，{result['fps']:g} fps，"
                      f"範圍 {first:g}–{last:g}（{result['seconds']:.1f} 秒）。{reference}"
                      "要撤銷請移除這次的動畫層。")

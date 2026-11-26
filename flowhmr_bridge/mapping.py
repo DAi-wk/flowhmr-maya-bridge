@@ -109,6 +109,50 @@ def _variants(profile, item):
     return sides if "{s}" in text or "{Side}" in text else [["", ""]]
 
 
+# FlowHMR joint names in SMPL-H slot order: the 52 slots of FlowHMR's preview solver.
+FLOWHMR_JOINTS = ["Hips", "LeftUpLeg", "RightUpLeg", "Spine", "LeftLeg", "RightLeg", "Spine1", "LeftFoot",
+                  "RightFoot", "Spine2", "LeftToeBase", "RightToeBase", "Neck", "LeftShoulder", "RightShoulder",
+                  "Head", "LeftArm", "RightArm", "LeftForeArm", "RightForeArm", "LeftHand", "RightHand"]
+FLOWHMR_JOINTS += [f"{side}Hand{digit}{i}" for side in ("Left", "Right")
+                   for digit in ("Index", "Middle", "Pinky", "Ring", "Thumb") for i in (1, 2, 3)]
+# Slots FlowHMR's solver cannot run without (retarget-profile.js BODY_REQUIRED).
+SOLVER_REQUIRED = (0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 18, 19, 20, 21)
+FOLLOW_KINDS = ("orient", "parent")
+
+
+def expand_hmr(profile):
+    """The block only the HMR-preview engine reads, with plain names:
+    (joints {FlowHMR joint: skin joint or None}, followers [(joint, control, kind)], hold {plug: value}).
+
+        "hmr": {"joints": {"{Side}Arm": "Shoulder_{s}"},         # solver slot -> skin joint
+                "followers": [["ShoulderPart1_{s}", "MicroShoulderPart1_{s}"],
+                              ["root", "FKroot_M", "parent"]],    # extra controls following a joint
+                "hold": {"FKSpine1_M.bias": 10}}                  # values held by this engine only
+    """
+    block = profile.get("hmr") or {}
+    joints = {}
+    for source, joint in (block.get("joints") or {}).items():
+        for short, word in _variants(profile, [source, joint]):
+            name = _expand_text(source, short, word)
+            if name not in FLOWHMR_JOINTS:
+                raise ValueError(f"hmr.joints 的 {name} 不是 FlowHMR 的關節名稱。")
+            joints[name] = _expand_text(joint, short, word) if joint else None
+    followers = []
+    for item in block.get("followers") or []:
+        if not isinstance(item, (list, tuple)) or len(item) not in (2, 3):
+            raise ValueError(f"hmr.followers 的每一項要是 [關節, 控制器] 或 [關節, 控制器, 種類]：{item}")
+        kind = item[2] if len(item) == 3 else "orient"
+        if kind not in FOLLOW_KINDS:
+            raise ValueError(f"hmr.followers 的種類要是 orient 或 parent：{item}")
+        for short, word in _variants(profile, item[:2]):
+            followers.append((_expand_text(item[0], short, word), _expand_text(item[1], short, word), kind))
+    hold = {}
+    for plug, value in (block.get("hold") or {}).items():
+        for short, word in _variants(profile, plug):
+            hold[_expand_text(plug, short, word)] = value
+    return joints, followers, hold
+
+
 def expand_ik(profile):
     """IK entries with plain names: {name, start, mid, end, control, pole, toe: [source, control] | None}."""
     entries = []
@@ -178,6 +222,14 @@ def slots_from_profile(profile):
             slots.setdefault(f"{toe_kind}_{side}", entry["toe"][1])
     extra = {k: v for k, v in profile.items()
              if k not in ("name", "rest", "root", "hold", "chains", "sides", "ik", "limbs")}
+    if extra.get("hmr"):
+        # build_profile writes plain names and no "sides", so the hmr block is kept expanded.
+        joints, followers, hmr_hold = expand_hmr(profile)
+        block = dict(extra["hmr"])
+        for key, value in (("joints", joints), ("followers", [list(f) for f in followers]), ("hold", hmr_hold)):
+            if key in block:
+                block[key] = value
+        extra["hmr"] = block
     return slots, profile.get("rest", "zero"), hold, extra
 
 

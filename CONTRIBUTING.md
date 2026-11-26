@@ -41,7 +41,7 @@ python -I tests/test_client.py -v
 
 會改變套用結果的修改，還要在 Maya 裡實測：
 
-- 只在**拋棄式的場景**或另開的 Maya 裡測，不要在有未存檔工作的場景裡測。`phase0_adv_test.py`、`stage1_generic_test.py`、`stage_generic_test.py`、`stage_raw_test.py` 都會對 rig 套用和烘焙動畫。
+- 只在**拋棄式的場景**或另開的 Maya 裡測，不要在有未存檔工作的場景裡測。`phase0_adv_test.py`、`stage1_generic_test.py`、`stage_generic_test.py`、`stage_raw_test.py`、`stage_custom_hmr_test.py` 都會對 rig 套用和烘焙動畫。
 - 在 PR 裡寫下實測環境（Maya 版本、rig 類型和版本、有沒有 namespace、動作幀數），以及量到的結果，例如旋轉和位置誤差。
 - README 裡的數字都是實測值。沒測過的情況請直接寫「沒測過」，不要用推測的數字。
 

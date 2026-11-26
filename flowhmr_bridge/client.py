@@ -131,7 +131,8 @@ class FlowHMRClient:
         if identifier:
             model = next((m for m in catalog["models"] if m["id"] == identifier), None)
             if not model or model["kind"] != "fbx":
-                raise FlowHMRError("這個任務指定的預覽角色無法用於 ADV。請選用同一個 rig 的蒙皮角色，或取消「使用 HMR 已儲存的角色設定」。")
+                raise FlowHMRError("這個任務指定的預覽角色不是 FBX，無法用在 Maya rig。請選用同一個 rig 的蒙皮角色，"
+                                   "或取消「使用 HMR 已儲存的角色設定」。")
             # Opening a library model only issues a local read ticket. It does not change the assignment.
             path = f"/api/character-library/{urllib.parse.quote(identifier, safe='')}/open"
             ticket = json.loads(self._response(path, method="POST")[1])["ticket"]

@@ -36,6 +36,7 @@ flowhmr_bridge.ui.show()
    - **原始動作 → ADV（HMR 預覽求解器）**：選目標 rig，按 **用原始動作套用到 ADV rig**。動作直接來自任務。
    - **AdvancedSkeleton**：選目標 rig，按 **套用到 ADV rig**。
    - **自訂對應**：選一份對應設定，面板會自動找出場景裡符合的 namespace，按 **套用到自訂 rig**。還沒有設定時，按 **新增…** 開啟自訂對應面板。
+   - **自訂對應＋HMR 預覽求解**：同一份對應設定，但改用 HMR 預覽的求解器，結果和 HMR 的角色預覽相同，見下方「自訂對應＋HMR 預覽求解」。
    - **HMR 角色 FBX**：ADV rig 照 FlowHMR 預覽裡的角色動作，見下方「HMR 角色 FBX」。
 4. 選完成後的幀率，按套用。FlowHMR 的動作會放在一個新的動畫層上。
 
@@ -154,6 +155,78 @@ Hive 測試 rig 的手腕在 IK 模式下，是透過額外加上的一層控制
 - 手指 IK（自訂的手指 IK 系統）還不支援，手指只能用 FK。
 - IK 腳用「伸展 × 腿長比」放置，所以 rig 的大腿、小腿比例跟來源差很多時，IK 腿的膝蓋彎曲會和 FK 腿差幾度（測試 rig 上 1–3°）。
 
+## 自訂對應＋HMR 預覽求解（任意 rig）
+
+這個模式和「原始動作 → ADV」用的是同一個求解器，只是對象換成任意 rig：
+
+- 動作來自任務的 SMPL-H 原始動作，在 rig 自己的蒙皮骨架上，用 HMR 的 `createFbxCharacterRetarget` 求解。
+- 再讓對應設定裡的控制器跟著求解出來的關節。
+- 需要 Node.js 22.15 以上。
+
+步驟和「自訂對應」相同：選對應設定和 namespace，選任務，再按 **用 HMR 預覽求解套用到自訂 rig**。**使用 HMR 已儲存的角色設定** 的意思和原始動作模式一樣：勾選時讀 HMR 為這個人物存的角色、關節對應和校正值，那個角色必須是這個 rig 的蒙皮 FBX。
+
+套用時：
+1. 對應到的控制器依設定檔的靜置規則歸零，並套用 hold 值。
+2. **探測**：每個控制器每軸轉 5°，看它實際帶動哪個蒙皮關節。會找最靠近根部、而且至少兩軸在世界空間一起轉的那一個。不用再另外指定骨架，ADV 測試 rig 上探測到的對應和 HMR 的定義完全相同。log 會列出控制器分成三類：
+   - **一比一帶動**：結果和 HMR 一致。
+   - **有一軸的扭轉分給其他關節**：例如 ADV 把上臂的扭轉分給 Part 關節。
+   - **把旋轉分散到多個關節**：例如脊椎 bias、ribbon 脊椎。
+3. 用 rig 的 build pose 求解。每個控制器以 build pose 時和關節的相對關係跟著目標；IK 控制器跟著手腳末端，pole 放在手肘、膝蓋彎曲的方向。
+4. 烘焙到新的動畫層。接上後和放進動畫層後，會在 6 個幀比對每個求解的關節，包括沒有控制器跟著的關節，結果寫在 log。
+
+設定檔可以加一個 `hmr` 區塊，只有這個模式會讀，舊的「自訂對應」不受影響：
+
+```json
+"hmr": {
+  "joints":    {"Spine": "spine_01_jnt"},
+  "followers": [["ShoulderPart1_{s}", "MicroShoulderPart1_{s}"], ["root", "FKroot_M", "parent"]],
+  "hold":      {"FKSpine1_M.bias": 10}
+}
+```
+
+- `joints`：直接指定某個 slot 用哪個蒙皮關節，蓋過探測結果。ribbon 脊椎這類控制器和關節不是一對一的部位要用到。值寫 `null` 表示不對應。
+- `followers`：額外的控制器跟著某個關節，例如扭轉分段關節的控制器，或角色整體移動的 root 關節。第三欄 `parent` 會連位移一起跟，預設 `orient`。
+- `hold`：只在這個模式固定的屬性，例如把脊椎 bias 設到讓整段彎曲留在主關節。會放進動畫層，靜音後回到原值。
+- 在人形定義面板裡編輯、存檔後，`hmr` 區塊會保留下來，`{s}`、`{Side}` 會展開成實際名稱。
+
+內建範本 **AdvancedSkeleton（HMR 預覽定義，FK）**（`profiles/adv_hmr.json`）：
+- slot 定義和 HMR 對 ADV 的定義相同。
+- 用 5 個 hold 固定脊椎、頸部的分配。
+- 用 23 個 Micro／FK Part 控制器對齊分段關節，`FKroot_M` 跟著 root 關節。
+- bias 10 是 ADV 6.755 的最大值，其他版本請確認。
+
+**數值求解**（可選，較慢）：勾 **分散型控制器用數值求解**，探測為「分散」的控制器會逐幀求解旋轉，讓它們帶動的關節盡量貼近預覽，其他控制器照常跟著。
+- 每一幀都從「跟隨」的結果出發，只接受讓整體誤差變小的解，所以不會比不勾更差。但整體誤差是所有關節的總和，個別關節有可能變差：研究時 ADV 的頸部最大差就從 20.2° 變成 23.7°。
+- 只用在沒有任何一軸是一比一的控制器上；範圍放太大會發散，所以不會套到其他控制器。
+- log 會寫出有幾幀比跟隨更接近。
+
+實測（Maya 2025、mayapy、303 幀測試動作）：
+- **ADV 測試 rig 加內建範本**：
+  - 最終動畫層和 HMR 匯出的角色 FBX 逐幀比較：70 個動畫關節和 Part 關節 × 303 幀，最大差 0.00005° / 0.00001 cm，和原始動作模式相同。rig 用 namespace 參照或不用 namespace 直接開啟，結果都一樣。
+  - 靜音動畫層後，5 個 hold 屬性回到 rig 原本的值。
+  - 在同一個模式的動畫層上再套用一次，結果相同。
+  - 在探測後、接上後各強制失敗一次。比對所有被驅動控制器的通道和設定、動畫層、namespace、幀率，以及場景裡的全部節點，都和套用前相同。
+  - 套用一次約 19 秒，其中探測 8 秒、烘焙 9 秒。
+  - 上面這組比對用的 HMR 匯出，是在 HMR 存的設定還沒有校正值時匯出的，所以驗證的是「只用 rig」這條路徑。
+- **使用 HMR 已儲存的角色設定**：先套一次只用 rig 的結果，再疊上已儲存的設定，比較每個關節的變化，但沒有和 HMR 匯出直接比對。
+  - 校正值：HMR 存的上臂 −13.4°，再加上合成的手肘 25°、頭 10° 和 3 cm、整個角色 20° 和 10 cm。
+  - rig 上量到：上臂 13.400°、手肘 25.000°、頭 10.000° 加 3.000 cm、root 20.000° 加 10.4 cm。root 繞樞紐旋轉，位置也會跟著移一點。
+  - 抽查的 27 個關節裡，其他 20 個的 local 不變。另外兩根拇指根部變了 73°，見下一點。
+  - HMR 的對應如果把某個 slot 對到 rig 沒有控制器的關節，log 會列出「沒有控制器跟著」。測試時 HMR 存的拇指對到 ThumbFinger2–4（只用 rig 時是 1–3），ADV 的拇指尖沒有 FK 控制器，那一節就和預覽差 80–96°。原始動作模式也一樣。
+- **ADV 測試 rig，只用通用方法**（不用 hmr 區塊，也沒有 ADV 專用的處理）：一比一的部位完全一致，包括根部、膝、踝、胸、頭、手腕和手指。上臂、前臂、大腿的扭轉差到 59°，脊椎、頸 16–27°，原因是 ADV 把旋轉分給了 Part 關節。
+- **Hive 測試 rig**（Zoo Hive 範本加 `hmr.joints` 指定脊椎；沒有 HMR 匯出可對照，比的是求解器的目標；以下是 log 在 6 個幀抽查的數字）：
+  - 四肢、鎖骨、頸、頭 0.000°。
+  - ribbon 脊椎最大差 13.7°，脊椎以上位置偏 2.7 cm。
+  - 勾數值求解後，303 幀全部比跟隨更接近：脊椎降到 7.9°（胸 6.4°），脊椎以上位置偏 1.6 cm，多 44 秒。
+  - root 關節沒有對應的控制器，偏 27 cm。
+  - 研究時逐幀量的最大差：只跟隨 20.6°，數值求解後 12.9°（當時的求解從上一幀接續，不是從跟隨出發）。
+
+限制：
+- 只在 ADV 和 Hive 測試 rig、一段動作上實測過，而且是在 mayapy 裡跑的；Maya 面板裡和 parallel evaluation 下還沒實際套用過。
+- `adv_hmr.json` 也會出現在舊「自訂對應」的設定清單裡。在那個模式下，`hmr` 區塊不會被讀取。
+- IK 手腳跟著求解的手腳末端擺放，但 IK 只能單軸彎，手肘、膝蓋的扭轉會和預覽不同；要完全一致請讓四肢顯示 FK。
+- 研究過程與完整數據在 `research/README.md`。
+
 ## 動畫層與覆蓋
 
 每次套用都會建立一個新的**覆蓋（override）動畫層**，名稱是 `FlowHMR_<namespace>_<影片名>`，FlowHMR 的動作全部在這一層上：
@@ -206,6 +279,9 @@ rig 已經有動畫時，要勾選 **rig 已有動畫時也套用**。套用時�
 | `flowhmr_bridge/ui.py` | Maya 主面板與動作來源選擇 |
 | `flowhmr_bridge/raw.py`、`preview_solve.mjs` | 原始 SMPL-H 到 ADV 控制器，使用安裝版的 HMR 角色求解器 |
 | `stage_raw_test.py` | 獨立 mayapy 驗證，可用已匯出的角色 FBX 逐幀比對最終動畫層和 Part 關節 |
+| `flowhmr_bridge/custom_preview.py` | 自訂對應＋HMR 預覽求解：探測控制器、在 rig 蒙皮骨架上求解、讓控制器跟著、烘焙並比對 |
+| `stage_custom_hmr_test.py` | 上面這個模式的 mayapy 驗證：和角色 FBX 逐幀比對、靜音後的設定、疊套用、強制失敗 |
+| `research/` | 「自訂對應能多接近 HMR 預覽」的研究腳本與結果 |
 | `flowhmr_bridge/character.py` | HMR 角色 FBX 模式：匯入 FlowHMR 匯出的角色 FBX、檢查骨架、讓 ADV 的 FK／IK 控制器跟著、烘焙並比對 |
 | `flowhmr_bridge/mapping_ui.py` | 人形定義面板（身體圖、手指圖、清單） |
 | `flowhmr_bridge/mapping.py` | 人形定義的部位欄位、必要部位、讀寫、鏡像、自動偵測規則，不依賴 Maya |
@@ -213,7 +289,7 @@ rig 已經有動畫時，要勾選 **rig 已有動畫時也套用**。套用時�
 | `tests/test_mapping.py` | 對應設定讀寫測試：`python -I tests/test_mapping.py -v` |
 | `phase0_adv_test.py` | 呼叫同一個 `adv.apply()`，並量測重定向誤差和烘焙漂移 |
 | `flowhmr_bridge/generic.py` | 通用引擎：依對應設定把 FlowHMR 的 `flowhmr` FBX 套到任意 rig 的 FK 控制器，含靜置姿勢校正 |
-| `flowhmr_bridge/profiles/*.json` | 對應設定檔。`adv_generic_test.json` 是拿 ADV rig 測試通用引擎用的 |
+| `flowhmr_bridge/profiles/*.json` | 對應設定檔。`adv_generic_test.json` 是拿 ADV rig 測試通用引擎用的；`adv_hmr.json` 是 ADV 的 HMR 預覽定義 |
 | `stage1_generic_test.py` | 第 1 階段測試：通用引擎和 ADV 結果對照、手臂垂下的靜置姿勢、失敗清理 |
 | `stage_generic_test.py` | 不限 rig 的測試腳本，量測用的骨頭對應寫在設定檔的 `test` 區塊 |
 | `flowhmr_bridge/profiles/zoo_hive_biped.json` | Zoo Hive 的身體和四肢 FK 對應。手指不在裡面，因為測試用的 Hive rig 手指由自訂的 IK 系統驅動 |

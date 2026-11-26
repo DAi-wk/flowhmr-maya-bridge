@@ -60,6 +60,37 @@ class RoundTrip(unittest.TestCase):
         self.assertEqual(len(mapping.SLOTS), 8 + 2 * (9 + 15 + 5))
         self.assertFalse(set(mapping.SOURCE_SLOT.values()) & mapping.IK_SLOTS)
 
+    def test_hmr_block(self):
+        profile = {"sides": [["L", "Left"], ["R", "Right"]],
+                   "hmr": {"joints": {"{Side}Arm": "Shoulder_{s}", "Hips": "Root_M", "Spine1": None},
+                           "followers": [["ShoulderPart1_{s}", "MicroShoulderPart1_{s}"], ["root", "FKroot_M", "parent"]],
+                           "hold": {"FKSpine1_M.bias": 10, "FKIK{Side}.blend": 0}}}
+        joints, followers, hold = mapping.expand_hmr(profile)
+        self.assertEqual(joints, {"LeftArm": "Shoulder_L", "RightArm": "Shoulder_R", "Hips": "Root_M", "Spine1": None})
+        self.assertEqual(followers, [("ShoulderPart1_L", "MicroShoulderPart1_L", "orient"),
+                                     ("ShoulderPart1_R", "MicroShoulderPart1_R", "orient"),
+                                     ("root", "FKroot_M", "parent")])
+        self.assertEqual(hold, {"FKSpine1_M.bias": 10, "FKIKLeft.blend": 0, "FKIKRight.blend": 0})
+        self.assertEqual(mapping.expand_hmr({}), ({}, [], {}))
+        self.assertEqual(len(mapping.FLOWHMR_JOINTS), 52)
+
+    def test_hmr_block_rejects_bad_entries(self):
+        for block in ({"joints": {"LeftHandle": "x"}}, {"followers": [["a"]]}, {"followers": [["a", "b", "point"]]}):
+            with self.subTest(block=block), self.assertRaises(ValueError):
+                mapping.expand_hmr({"hmr": block})
+
+    def test_hmr_template_keeps_its_block(self):
+        profile = json.loads((PROFILES / "adv_hmr.json").read_text(encoding="utf-8"))
+        slots, rest, hold, extra = mapping.slots_from_profile(profile)
+        rebuilt = mapping.build_profile(profile["name"], slots, rest, hold, extra)
+        # The editor saves plain names without "sides": the block must survive expanded.
+        self.assertNotIn("sides", rebuilt)
+        self.assertEqual(mapping.expand_hmr(rebuilt), mapping.expand_hmr(profile))
+        joints, followers, hold = mapping.expand_hmr(rebuilt)
+        self.assertEqual(len(followers), 24)
+        self.assertIn(("root", "FKroot_M", "parent"), followers)
+        self.assertIn(("ShoulderPart1_R", "MicroShoulderPart1_R", "orient"), followers)
+
     def test_mirror_candidates(self):
         self.assertIn("char:arm_R_shldr_fk_anim", mapping.mirror_candidates("char:arm_L_shldr_fk_anim"))
         self.assertIn("FKShoulder_R", mapping.mirror_candidates("FKShoulder_L"))

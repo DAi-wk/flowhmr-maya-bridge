@@ -147,26 +147,30 @@ def _solve(source, skeleton, helper_names):
         return tracks, samples
 
 
-def _check_target(namespace, tracks):
-    """Verify which ADV skin skeleton the saved mapping and bind offsets belong to."""
-    if tracks["pelvis"] != character.PELVIS:
-        raise ApplyError(f"預覽角色的骨盆 {tracks['pelvis']} 和 ADV 的 {character.PELVIS} 不同。")
+def _check_target(namespace, tracks, pelvis_name=character.PELVIS):
+    """Verify which skin skeleton the saved mapping and bind offsets belong to. ``pelvis_name``
+    None accepts the solver's own pelvis (any rig); ADV insists on Root_M."""
+    if pelvis_name and tracks["pelvis"] != pelvis_name:
+        raise ApplyError(f"預覽角色的骨盆 {tracks['pelvis']} 和 ADV 的 {pelvis_name} 不同。")
+    pelvis_name = tracks["pelvis"]
+    if len(cmds.ls(namespace + pelvis_name, type="joint") or []) != 1:
+        raise ApplyError(f"rig 找不到唯一的骨盆關節 {pelvis_name}。")
     names = {r["name"] for r in tracks["records"]}
     # A rigid placement of the entire Maya character does not change its bind skeleton.
-    pelvis = cmds.getAttr(namespace + character.PELVIS + ".worldMatrix[0]")
-    base = next(r["rest"] for r in tracks["records"] if r["name"] == character.PELVIS)
+    pelvis = cmds.getAttr(namespace + pelvis_name + ".worldMatrix[0]")
+    base = next(r["rest"] for r in tracks["records"] if r["name"] == pelvis_name)
     rig_origin, rig_inverse = om.MVector(*pelvis[12:15]), character._rotation(pelvis).inverse()
     src_origin, src_inverse = om.MVector(*base[:3]), om.MQuaternion(*base[3:7]).inverse()
     for record in tracks["records"]:
         name = record["name"]
         found = cmds.ls(namespace + name, long=True, type="joint") or []
         if len(found) != 1:
-            raise ApplyError(f"ADV 找不到唯一的預覽關節 {name}。")
+            raise ApplyError(f"rig 找不到唯一的預覽關節 {name}。")
         path = found[0].rpartition("|")[0]
         while path and character._short(path) not in names:
             path = path.rpartition("|")[0]
         if (character._short(path) or None) != record["parent"]:
-            raise ApplyError(f"ADV 關節 {name} 的父骨與預覽骨架不同。")
+            raise ApplyError(f"rig 關節 {name} 的父骨與預覽骨架不同。")
         matrix = cmds.getAttr(found[0] + ".worldMatrix[0]")
         rest = record["rest"]
         rig_position = (om.MVector(*matrix[12:15]) - rig_origin).rotateBy(rig_inverse)
