@@ -16,6 +16,7 @@ elbow or knee bends around one axis, while the exported joints may also twist.
 from __future__ import annotations
 
 import math
+import re
 import time
 import traceback
 from pathlib import Path
@@ -26,6 +27,7 @@ import maya.mel as mel
 
 from . import adv
 from . import generic
+from . import hinge
 from . import layers
 from . import timing as timing_mod
 from .adv import ApplyError, count_flips
@@ -356,6 +358,30 @@ def _constraints():
     return [c for c in cmds.ls(type="constraint") if cmds.attributeQuery(TAG, node=c, exists=True)]
 
 
+ARM_TWIST = re.compile(r"(Shoulder|Elbow)(Part\d+)?_[LR]")
+
+
+def clean_elbows(namespace, frames, log):
+    """Z-only FK elbows on both arms after the bake (hinge.clean_baked). The FKX joints are the
+    positions kept: with the arm in FK they carry the skin joints."""
+    chains = []
+    for side, label in (("L", "左臂"), ("R", "右臂")):
+        controls = tuple(f"{namespace}FK{j}_{side}" for j in ("Shoulder", "Elbow", "Wrist"))
+        joints = tuple(f"{namespace}FKX{j}_{side}" for j in ("Shoulder", "Elbow", "Wrist"))
+        if not all(cmds.objExists(n) for n in joints):
+            joints = tuple(f"{namespace}{j}_{side}" for j in ("Shoulder", "Elbow", "Wrist"))
+        problem = hinge.usable(controls) or next((f"找不到 {j}" for j in joints if not cmds.objExists(j)), None)
+        if problem:
+            log(f"{label}不能改成手肘只轉單軸：{problem}")
+            continue
+        chains.append((label, controls, joints))
+    report = hinge.clean_baked(chains, frames)
+    if report:
+        log(hinge.describe(report) + ("。上臂、前臂的扭轉改由 rig 分配，和預覽不同；手臂位置和手掌方向不變。"
+                                               if hinge.cleaned(report) else "。"))
+    return report
+
+
 def _check_frames(start, end, count=6):
     if end <= start:
         return [start]
@@ -364,17 +390,17 @@ def _check_frames(start, end, count=6):
 
 # ------------------------------------------------------------------ apply
 def apply(main, fbx=None, target_unit=None, log=print, on_connected=None, on_baked=None, overwrite=False,
-          label=None, preview_source=None):
+          label=None, preview_source=None, z_only=False):
     """Bake the exported character motion ``fbx`` onto the ADV rig whose Main control is ``main``.
     The result goes on a new override animation layer. Returns a summary dict; the connection
     check (rig joints vs exported joints with the constraints live, before the bake) is in
-    ``check``."""
+    ``check``. ``z_only``: the FK elbows keep only their Z bend (hinge.clean_baked); arm
+    positions and hands stay, the arm Micro controls are left to the rig's own twist."""
     started = time.time()
     rig = adv.inspect_rig(main, overwrite=overwrite)
     if rig["issues"]:
         raise ApplyError(" ".join(rig["issues"]))
     namespace = rig["namespace"]
-    adv.ensure_adv()
     raw = preview_source is not None
     if raw and cmds.upAxis(q=True, axis=True) != "y":
         raise ApplyError("原始動作模式需要 Y 軸朝上的場景。")
@@ -439,6 +465,9 @@ def apply(main, fbx=None, target_unit=None, log=print, on_connected=None, on_bak
         else:
             structure = check_structure(namespace, joints, moving)
         found, unmapped = pairs(namespace, moving)
+        if z_only:
+            # Micro controls on the upper arm / forearm would put the preview's twist back.
+            correctives = [c for c in correctives if not ARM_TWIST.fullmatch(c[0])]
         found.extend(correctives)
         if not any(control == namespace + ROOT_CONTROL for _, control, _ in found):
             raise ApplyError(f"找不到 {ROOT_CONTROL}，或角色 FBX 的 {PELVIS} 沒有動作。")
@@ -476,6 +505,9 @@ def apply(main, fbx=None, target_unit=None, log=print, on_connected=None, on_bak
         finally:
             cmds.refresh(suspend=False)
         cmds.delete(_constraints())
+        hinge_report = None
+        if z_only:
+            hinge_report = clean_elbows(namespace, frames, log)
         cmds.currentTime(start, edit=True, update=True)
         baked = compare(namespace, joints, driven, _check_frames(start, end))
         log(f"烘焙後：{describe(baked)}")
@@ -503,6 +535,7 @@ def apply(main, fbx=None, target_unit=None, log=print, on_connected=None, on_bak
         cmds.currentTime(0, edit=True)
         cmds.select(clear=True)
         return {"main": main, "namespace": namespace, "layer": layer, "structure": structure, "check": check, "baked_check": baked,
+                "z_only": hinge_report,
                 "driven_controls": len(kinds), "unmapped_joints": unmapped, "skipped_controls": [_short(c) for c in skipped],
                 "fk_switches": len(switches), "bake_range_30fps": (start, end), "euler_flips_fixed": flips, "keys": keys,
                 "time_unit": cmds.currentUnit(q=True, time=True), "fps": timing_mod.scene_fps(),

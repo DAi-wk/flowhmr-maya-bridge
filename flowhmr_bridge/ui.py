@@ -37,8 +37,21 @@ OPTION_MODE = "flowhmrBridgeMode"
 OPTION_PROFILE = "flowhmrBridgeProfile"
 OPTION_CHAR_DIR = "flowhmrBridgeCharacterDir"
 OPTION_REFINE = "flowhmrBridgeRefineSpread"
+OPTION_PORT = "flowhmrBridgePort"  # 0 = find it (desktop app, web server, defaults)
+OPTION_Z_ONLY = "flowhmrBridgeZOnlyElbows"
 CUSTOM_MODES = ("custom", "custom_hmr")
 PREVIEW_MODES = ("raw", "custom_hmr")  # read the job's SMPL-H stream and run FlowHMR's preview solver
+LEGACY_MODES = ("adv", "custom", "character")
+LEGACY_COLOR = "#8a8a8a"
+CURRENT_COLOR = "#ffffff"
+LEGACY_TIP = "舊版：不使用 HMR 預覽求解器，結果和 HMR 的角色預覽不同。建議改用上面的 HMR 預覽求解模式。"
+MODES = (  # (text, data, tooltip), in menu order
+    ("原始動作 → ADV（HMR 預覽求解器）", "raw", "ADV rig：在 rig 的蒙皮骨架上跑 HMR 預覽的求解器，結果和 HMR 角色預覽相同。"),
+    ("自訂對應＋HMR 預覽求解（任意 rig）", "custom_hmr", "任意 rig：用對應設定的控制器跟著 HMR 預覽求解的結果。"),
+    ("AdvancedSkeleton 動捕庫（舊版）", "adv", LEGACY_TIP + "\n用 ADV 自己的 MoCapLibrary 套用 FlowHMR 匯出的 FBX，需要 AdvancedSkeleton。"),
+    ("自訂對應（舊版，校正對齊）", "custom", LEGACY_TIP + "\n用 FlowHMR 的 FBX 和靜置姿勢校正，套到對應設定的控制器。"),
+    ("HMR 角色 FBX（舊版，ADV rig）", "character", LEGACY_TIP + "\n用從 FlowHMR 手動匯出的角色 FBX，套到同一個 ADV rig。"),
+)
 POLL_MS = 3000
 CHARACTER_HINT = ("在 FlowHMR 預覽裡，替這個人物套用 rig 自己的蒙皮 FBX 當角色並儲存重定向，"
                   "再按「匯出 FBX…」，格式選「目前角色 FBX」（不用勾「包含蒙皮網格」）。"
@@ -65,7 +78,8 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         super().__init__(parent=parent)
         self.setObjectName(self.NAME)
         self.setWindowTitle(f"FlowHMR Bridge {__version__}")
-        self.client = client_mod.FlowHMRClient(root=_option(OPTION_ROOT, str(client_mod.DEFAULT_ROOT)))
+        self.client = client_mod.FlowHMRClient(root=_option(OPTION_ROOT, str(client_mod.DEFAULT_ROOT)),
+                                               port=int(_option(OPTION_PORT, 0)) or None)
         self.signals = _Signals()
         self.signals.jobs.connect(self._on_jobs)
         self.signals.thumbnail.connect(self._on_thumbnail)
@@ -102,6 +116,15 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         browse.clicked.connect(self._browse_root)
         root_row.addWidget(self.root_edit, 1)
         root_row.addWidget(browse)
+        root_row.addWidget(QtWidgets.QLabel("埠號"))
+        self.port_spin = QtWidgets.QSpinBox()
+        self.port_spin.setRange(0, 65535)
+        self.port_spin.setSpecialValueText("自動")
+        self.port_spin.setValue(int(_option(OPTION_PORT, 0)))
+        self.port_spin.setToolTip("FlowHMR 的本機埠號。「自動」會依序試：桌面版記錄的埠號、網頁版（start-web.cmd -ServerOnly）"
+                                  "記錄的埠號、60550、8080（直接執行 app.py 的預設值）。網頁版用了其他埠號時，請在這裡輸入。")
+        self.port_spin.editingFinished.connect(self._port_changed)
+        root_row.addWidget(self.port_spin)
         layout.addLayout(root_row)
 
         layout.addWidget(QtWidgets.QLabel("FlowHMR 任務"))
@@ -115,11 +138,15 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
 
         mode_form = QtWidgets.QFormLayout()
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItem("原始動作 → ADV（HMR 預覽求解器）", "raw")
-        self.mode_combo.addItem("AdvancedSkeleton（ADV 動捕庫）", "adv")
-        self.mode_combo.addItem("自訂對應（任意 rig）", "custom")
-        self.mode_combo.addItem("自訂對應＋HMR 預覽求解（任意 rig）", "custom_hmr")
-        self.mode_combo.addItem("HMR 角色 FBX（ADV rig，照 FlowHMR 預覽）", "character")
+        # The HMR preview solver modes first; the older modes below, greyed and marked as such.
+        for text, data, tip in MODES:
+            self.mode_combo.addItem(text, data)
+            index = self.mode_combo.count() - 1
+            self.mode_combo.setItemData(index, tip, QtCore.Qt.ToolTipRole)
+            color = LEGACY_COLOR if data in LEGACY_MODES else CURRENT_COLOR
+            self.mode_combo.setItemData(index, QtGui.QBrush(QtGui.QColor(color)), QtCore.Qt.ForegroundRole)
+            if data == PREVIEW_MODES[-1]:
+                self.mode_combo.insertSeparator(self.mode_combo.count())
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(_option(OPTION_MODE, "raw"))))
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         mode_form.addRow("rig 類型", self.mode_combo)
@@ -135,8 +162,13 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         rig_refresh = QtWidgets.QToolButton(text="↻")
         rig_refresh.setToolTip("重新掃描場景中的 ADV rig")
         rig_refresh.clicked.connect(self.refresh_rigs)
+        adv_browse = QtWidgets.QToolButton(text="ADV…")
+        adv_browse.setToolTip("指定 AdvancedSkeleton.mel 的位置。通常不用：面板會從已載入的 ADV、ADV 安裝時建立的工具列按鈕、"
+                              "Maya 的 script 路徑和使用者資料夾自動找，找到後會記住。")
+        adv_browse.clicked.connect(self._browse_adv)
         rig_row.addWidget(self.rig_combo, 1)
         rig_row.addWidget(rig_refresh)
+        rig_row.addWidget(adv_browse)
         form.addRow("目標 rig", rig_row)
         layout.addWidget(self.adv_box)
 
@@ -183,6 +215,14 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                                      "每段動作多花 1–4 分鐘；只會用在探測結果是「分散」的控制器。")
         self.refine_check.toggled.connect(lambda on: cmds.optionVar(iv=(OPTION_REFINE, int(on))))
         layout.addWidget(self.refine_check)
+        self.z_only_check = QtWidgets.QCheckBox("手肘只轉 Z（單軸彎曲；手臂位置、手掌方向不變，扭轉交給 rig）")
+        self.z_only_check.setChecked(bool(_option(OPTION_Z_ONLY, 0)))
+        self.z_only_check.setToolTip("動畫師 key 手肘通常只轉 Z。勾選後，FK 手肘的 X/Y 會改成上臂沿骨頭的扭轉加上 Z 彎曲："
+                                     "肩、肘、腕的位置和手掌方向不變，但上臂、前臂的扭轉分配會和 HMR 預覽不同"
+                                     "（上臂、前臂的 Micro／跟隨控制器不套用）。\n手肘控制器以別的軸彎曲的 rig（例如 Hive 是 Y），"
+                                     "會從動作判斷實際的彎曲軸，改成只轉那一軸。")
+        self.z_only_check.toggled.connect(lambda on: cmds.optionVar(iv=(OPTION_Z_ONLY, int(on))))
+        layout.addWidget(self.z_only_check)
 
         # character FBX mode (uses the ADV rig row above)
         self.char_box = QtWidgets.QWidget()
@@ -249,6 +289,13 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.adv_box.setVisible(mode not in CUSTOM_MODES)
         self.use_character.setVisible(mode in PREVIEW_MODES)
         self.refine_check.setVisible(mode == "custom_hmr")
+        self.z_only_check.setVisible(mode in PREVIEW_MODES)
+        # The closed box shows the chosen entry in its own colour too (white, or grey for a legacy mode).
+        palette = self.mode_combo.palette()
+        color = QtGui.QColor(LEGACY_COLOR if mode in LEGACY_MODES else CURRENT_COLOR)
+        for role in (QtGui.QPalette.ButtonText, QtGui.QPalette.Text, QtGui.QPalette.WindowText):
+            palette.setColor(role, color)
+        self.mode_combo.setPalette(palette)
         self.custom_box.setVisible(mode in CUSTOM_MODES)
         self.char_box.setVisible(mode == "character")
         self.apply_button.setText({"custom": "套用到自訂 rig", "custom_hmr": "用 HMR 預覽求解套用到自訂 rig",
@@ -302,9 +349,34 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         root = self.root_edit.text().strip()
         if root and root != str(self.client.root):
             cmds.optionVar(sv=(OPTION_ROOT, root))
-            self.client = client_mod.FlowHMRClient(root=root)
-            self._signature = None
-            self.poll(force=True)
+            self._new_client()
+
+    def _browse_adv(self):
+        current = adv.find_adv_mel()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇 AdvancedSkeleton.mel",
+                                                        str(current.parent) if current else "",
+                                                        "AdvancedSkeleton (AdvancedSkeleton.mel)")
+        if not path:
+            return
+        try:
+            version = adv.set_adv_mel(path)
+            self.log(f"已指定 AdvancedSkeleton {version}：{path}。如果 Maya 已經載入了別的版本，重開 Maya 後才會改用這個。")
+        except adv.ApplyError as error:
+            QtWidgets.QMessageBox.warning(self, "FlowHMR Bridge", str(error))
+        self._update_state()
+
+    def _port_changed(self):
+        port = self.port_spin.value() or None
+        if port != self.client.fixed_port:
+            cmds.optionVar(iv=(OPTION_PORT, port or 0))
+            self._new_client()
+
+    def _new_client(self):
+        self.client = client_mod.FlowHMRClient(root=self.root_edit.text().strip() or None,
+                                               port=self.port_spin.value() or None)
+        self.connected = False
+        self._signature = None
+        self.poll(force=True)
 
     def _browse_root(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇 FlowHMR 資料夾", self.root_edit.text())
@@ -317,11 +389,12 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
             return
         self._polling = True
         client = self.client
-        if not self.connected:  # FlowHMR may have restarted on another port.
-            client.port = client_mod.discover_port(client.root)
+        search = not self.connected  # FlowHMR may have restarted, or run as the web version, on another port
 
         def work():
             try:
+                if search:
+                    client.locate()
                 self.signals.jobs.emit((True, client.jobs(), client))
             except client_mod.FlowHMRError as error:
                 self.signals.jobs.emit((False, str(error), client))
@@ -339,7 +412,9 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.connected = ok
         if not ok:
             self.status.setText(f"<span style='color:#d05050'>●</span> 未連線 · {client.base_url}")
-            self.status.setToolTip(f"{data}\n請先啟動 FlowHMR 桌面版。")
+            hint = ("請確認 FlowHMR 在這個埠號執行，或把「埠號」改回「自動」。" if client.fixed_port else
+                    "請先啟動 FlowHMR（桌面版或網頁版）。網頁版用了其他埠號時，請在上方「埠號」輸入。")
+            self.status.setToolTip(f"{data}\n{hint}")
             if was:
                 self.log("與 FlowHMR 的連線中斷。")
             self._set_jobs([])
@@ -502,6 +577,12 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 notes += rig["issues"] + rig["notes"]
                 blocked = blocked or bool(rig["issues"])
                 namespace = rig["namespace"] if cmds.objExists(main) else None
+                # Only the MoCapLibrary mode runs ADV's own scripts; the others read the rig's
+                # build pose record themselves (adv.apply_build_pose).
+                if self.mode() == "adv" and adv.find_adv_mel() is None:
+                    notes.append("找不到 AdvancedSkeleton.mel，ADV 動捕庫模式無法使用。請先在 Maya 開一次 AdvancedSkeleton，"
+                                 "或按「ADV…」指定位置；其他模式不需要。")
+                    blocked = True
             if self.mode() == "character":
                 path, job = self.character_path(), self.selected_job()
                 if path is None:
@@ -559,9 +640,10 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         elif self.mode() == "custom_hmr":
             target = {"mode": "custom_hmr", "profile": self.profile_combo.currentData(),
                       "namespace": self.ns_combo.currentData(), "use_character": self.use_character.isChecked(),
-                      "refine": self.refine_check.isChecked()}
+                      "refine": self.refine_check.isChecked(), "z_only": self.z_only_check.isChecked()}
         elif self.mode() == "raw":
-            target = {"mode": "raw", "main": self.rig_combo.currentText(), "use_character": self.use_character.isChecked()}
+            target = {"mode": "raw", "main": self.rig_combo.currentText(), "use_character": self.use_character.isChecked(),
+                      "z_only": self.z_only_check.isChecked()}
         else:
             target = {"mode": "adv", "main": self.rig_combo.currentText()}
             folder = adv.staging_root() / job["id"]
@@ -659,13 +741,13 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 elif target["mode"] == "custom_hmr":
                     result = custom_preview.apply(target["namespace"], target["profile"], data, target_unit=unit,
                                                   log=self.log, overwrite=target["overwrite"], label=target["label"],
-                                                  refine=target["refine"])
+                                                  refine=target["refine"], z_only=target["z_only"])
                 elif target["mode"] == "character":
                     result = character.apply(target["main"], data, target_unit=unit, log=self.log,
                                              overwrite=target["overwrite"], label=target["label"])
                 elif target["mode"] == "raw":
                     result = character.apply(target["main"], preview_source=data, target_unit=unit, log=self.log,
-                                             overwrite=target["overwrite"], label=target["label"])
+                                             overwrite=target["overwrite"], label=target["label"], z_only=target["z_only"])
                 else:
                     result = adv.apply(target["main"], data, target_unit=unit, log=self.log,
                                        overwrite=target["overwrite"], label=target["label"])

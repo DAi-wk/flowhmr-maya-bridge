@@ -26,7 +26,8 @@ def _default_root():
 
 
 DEFAULT_ROOT = _default_root()
-DEFAULT_PORT = 60550
+DEFAULT_PORT = 60550      # FlowHMR.exe / start-web.cmd
+WEB_DEFAULT_PORT = 8080   # app.py started by hand
 FINISHED, ACTIVE = "done", ("queued", "running", "waiting_user", "cancel_requested")
 # Loopback only: never route through a system or environment proxy.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -36,21 +37,54 @@ class FlowHMRError(RuntimeError):
     """FlowHMR is unreachable or answered with an error."""
 
 
-def discover_port(root=None):
-    """FlowHMR writes the desktop port here; fall back to the launcher default."""
-    path = Path(root or DEFAULT_ROOT) / ".cache" / "desktop-port.txt"
+def discover_ports(root=None):
+    """Ports FlowHMR may be serving on, most likely first:
+    the desktop app's record (.cache/desktop-port.txt), the web server's record
+    (logs/web-process.json, written by start-web.cmd -ServerOnly), the launcher default, and
+    app.py's own default when the web server is started by hand."""
+    root = Path(root or DEFAULT_ROOT)
+    ports = []
     try:
-        port = int(path.read_text(encoding="ascii").strip())
-        return port if 0 < port < 65536 else DEFAULT_PORT
+        ports.append(int((root / ".cache" / "desktop-port.txt").read_text(encoding="ascii").strip()))
     except (OSError, ValueError):
-        return DEFAULT_PORT
+        pass
+    try:  # PowerShell writes it with a byte-order mark
+        ports.append(int(json.loads((root / "logs" / "web-process.json").read_text(encoding="utf-8-sig"))["port"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    ports += [DEFAULT_PORT, WEB_DEFAULT_PORT]
+    return [port for port in dict.fromkeys(ports) if 0 < port < 65536]
+
+
+def discover_port(root=None):
+    """The most likely port (see discover_ports)."""
+    return discover_ports(root)[0]
 
 
 class FlowHMRClient:
     def __init__(self, root=None, port=None, timeout=2.0):
+        """``port`` fixes the port (a web server started on its own port, say); without it the
+        client looks for FlowHMR on the ports discover_ports() lists (see locate)."""
         self.root = Path(root or DEFAULT_ROOT)
-        self.port = int(port or discover_port(self.root))
+        self.fixed_port = int(port) if port else None
+        self.port = self.fixed_port or discover_port(self.root)
         self.timeout = timeout
+
+    def locate(self, timeout=0.6):
+        """Without a fixed port, switch to the first listed port where FlowHMR answers.
+        Returns True when one answered (the port stays as it was otherwise)."""
+        if self.fixed_port:
+            return False
+        current = self.port
+        for port in dict.fromkeys([current] + discover_ports(self.root)):
+            self.port = port
+            try:
+                self._info(timeout)
+                return True
+            except FlowHMRError:
+                continue
+        self.port = current
+        return False
 
     @property
     def base_url(self):
@@ -82,8 +116,11 @@ class FlowHMRClient:
 
     def info(self):
         """Server and runtime summary; raises FlowHMRError when FlowHMR is not running."""
-        data = self._json("/api/info")
-        if "fps" not in data:
+        return self._info()
+
+    def _info(self, timeout=None):
+        data = self._json("/api/info", timeout)
+        if not isinstance(data, dict) or "fps" not in data:
             raise FlowHMRError(f"{self.base_url} does not look like FlowHMR")
         return data
 

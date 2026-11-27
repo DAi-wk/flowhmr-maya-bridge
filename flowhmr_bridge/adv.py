@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import time
@@ -77,14 +78,102 @@ class ApplyError(RuntimeError):
 
 
 # ------------------------------------------------------------------ AdvancedSkeleton
-def _adv_mel_path():
+OPTION_ADV_MEL = "flowhmrBridgeAdvMel"
+ADV_MEL = "AdvancedSkeleton.mel"
+# ADV's installer writes shelf buttons like:  source \"D:/Tools/AdvancedSkeleton/AdvancedSkeleton.mel\";
+_SHELF_SOURCE = re.compile(r'source\s+\\?"([^"\n]*?AdvancedSkeleton\.mel)\\?"', re.IGNORECASE)
+_found_cache = None
+
+
+def _mel_version(path):
+    """(6, 755) from the "Version 6.755" header line, () when unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for _ in range(10):
+                match = re.search(r"Version\s+([\d.]+)", handle.readline())
+                if match:
+                    return tuple(int(part) for part in match[1].split(".") if part)
+    except OSError:
+        pass
+    return ()
+
+
+def _shelf_paths():
+    """AdvancedSkeleton.mel paths that shelf buttons source: the shelves loaded now, and the
+    saved shelf files (a shelf that has not been opened yet in this session)."""
+    texts = []
+    try:
+        for button in cmds.lsUI(type="shelfButton") or []:
+            texts.append(cmds.shelfButton(button, q=True, command=True) or "")
+    except RuntimeError:  # no UI (mayapy)
+        pass
+    shelves = Path(cmds.internalVar(userShelfDir=True))
+    for path in sorted(shelves.glob("shelf_*.mel")) if shelves.is_dir() else []:
+        try:
+            texts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    found = []
+    for text in texts:
+        found += [match.replace("\\\\", "/") for match in _SHELF_SOURCE.findall(text)]
+    return found
+
+
+def adv_mel_candidates():
+    """Every AdvancedSkeleton.mel this Maya points at, wherever ADV was unpacked: shelf buttons
+    from ADV's installer, MAYA_SCRIPT_PATH and the Maya user folder."""
+    paths = list(_shelf_paths())
+    for folder in filter(None, (mel.eval('getenv "MAYA_SCRIPT_PATH"') or "").split(os.pathsep)):
+        paths.append(Path(folder) / ADV_MEL)
+        paths += list(Path(folder).glob(f"AdvancedSkeleton*/{ADV_MEL}")) if Path(folder).is_dir() else []
+    user = Path(cmds.internalVar(userAppDir=True))
+    paths += list(user.glob(f"AdvancedSkeleton*/{ADV_MEL}")) + list(user.glob(f"scripts/AdvancedSkeleton*/{ADV_MEL}"))
+    unique = {}
+    for path in paths:
+        path = Path(path)
+        if path.is_file():
+            unique.setdefault(str(path.resolve()).lower(), path.resolve())
+    return list(unique.values())
+
+
+def set_adv_mel(path):
+    """Remember the AdvancedSkeleton.mel to use (the panel's ADV… button). Returns its version."""
+    path = Path(path)
+    if path.name.lower() != ADV_MEL.lower() or not path.is_file():
+        raise ApplyError(f"請選擇 {ADV_MEL}（AdvancedSkeleton 解壓縮後資料夾裡的主程式）。")
+    global _found_cache
+    cmds.optionVar(sv=(OPTION_ADV_MEL, path.as_posix()))
+    _found_cache = None
+    return ".".join(map(str, _mel_version(path)))
+
+
+def find_adv_mel():
+    """The AdvancedSkeleton.mel to source, or None:
+    1. the one this Maya session already loaded (or finds on its script path);
+    2. the one picked in the panel, or found on an earlier run;
+    3. the newest version among adv_mel_candidates() (later file on a tie)."""
+    global _found_cache
     found = mel.eval('whatIs "AdvancedSkeleton"')
     if "found in: " in found:
-        return Path(found.split("found in: ", 1)[1].strip())
-    candidates = sorted(Path(cmds.internalVar(userAppDir=True)).glob("AdvancedSkeleton*/AdvancedSkeleton.mel"))
-    if not candidates:
-        raise ApplyError("AdvancedSkeleton.mel was not found under the Maya user folder.")
-    return candidates[-1]
+        path = Path(found.split("found in: ", 1)[1].strip())
+        if path.is_file():
+            return path
+    saved = cmds.optionVar(q=OPTION_ADV_MEL) if cmds.optionVar(exists=OPTION_ADV_MEL) else ""
+    if saved and Path(saved).is_file():
+        return Path(saved)
+    if _found_cache is None or not _found_cache.is_file():
+        candidates = adv_mel_candidates()
+        _found_cache = max(candidates, key=lambda p: (_mel_version(p), p.stat().st_mtime)) if candidates else None
+    return _found_cache
+
+
+def _adv_mel_path():
+    path = find_adv_mel()
+    if path is None:
+        raise ApplyError("找不到 AdvancedSkeleton.mel。請先在 Maya 開一次 AdvancedSkeleton，"
+                         "或在面板按「ADV…」指定 AdvancedSkeleton.mel 的位置。")
+    cmds.optionVar(sv=(OPTION_ADV_MEL, path.as_posix()))  # found once, found again next session
+    return path
 
 
 def ensure_adv():
@@ -94,7 +183,8 @@ def ensure_adv():
         mel.eval(f'source "{path.as_posix()}"')
     missing = [proc for proc in ADV_PROCS if not mel.eval(f'exists "{proc}"')]
     if missing:
-        raise ApplyError(f"AdvancedSkeleton procedures are missing: {missing}")
+        raise ApplyError(f"{path} 少了 AdvancedSkeleton 的指令（{', '.join(missing)}），可能不是完整的 AdvancedSkeleton。"
+                         "請在面板按「ADV…」重新指定 AdvancedSkeleton.mel。")
     version = ""
     with open(path, encoding="utf-8", errors="replace") as handle:
         for _ in range(10):
@@ -362,10 +452,43 @@ def reset_unrecorded(namespace):
     return reset
 
 
+_BUILD_POSE_COMMANDS = ("setAttr", "xform")
+
+
+def apply_build_pose(namespace):
+    """What asGoToBuildPose does for a body ControlSet, without AdvancedSkeleton's scripts:
+    run the setAttr / xform commands ADV recorded on the rig's buildPose node, with the
+    namespace put in front of the node name (the second word, or the last one for xform).
+    Only those two commands run. Returns the commands that failed."""
+    node = namespace + "buildPose"
+    text = "".join(cmds.getAttr(f"{node}.{attr}") or "" for attr in BUILD_POSE_ATTRS
+                   if cmds.objExists(f"{node}.{attr}"))
+    if not text:
+        raise ApplyError(f"找不到 ADV 的 build pose 記錄（{node}.udAttr）。")
+    failed = []
+    for command in text.split(";"):
+        words = command.split()
+        if not words:
+            continue
+        if words[0] not in _BUILD_POSE_COMMANDS or len(words) < 2:
+            failed.append(command.strip())
+            continue
+        if namespace:
+            at = len(words) - 1 if words[0] == "xform" else 1
+            words[at] = namespace + words[at]
+        command = " ".join(words)
+        # catchQuiet like ADV: a locked or driven channel is skipped without an error message
+        if mel.eval('catchQuiet(`eval "%s"`)' % command.replace("\\", "\\\\").replace('"', '\\"')):
+            failed.append(command)
+    return failed
+
+
 def go_to_build_pose(main, namespace):
-    """ADV's build pose, plus the controls its record leaves out (see reset_unrecorded)."""
-    cmds.select(main, replace=True)
-    mel.eval('asGoToBuildPose ""')
+    """ADV's build pose, plus the controls its record leaves out (see reset_unrecorded).
+    Works without AdvancedSkeleton loaded (see apply_build_pose)."""
+    failed = apply_build_pose(namespace)
+    if failed:
+        print("// FlowHMR Bridge: build pose commands that did not apply: " + "; ".join(failed[:10]))
     return reset_unrecorded(namespace)
 
 

@@ -88,7 +88,22 @@ def run(args):
     runs = 2 if args.stack else 1
     result = None
     for i in range(runs):
-        result = custom_preview.apply(ns, profile, source, label=f"custom_hmr_{i}", overwrite=True, refine=args.refine)
+        result = custom_preview.apply(ns, profile, source, label=f"custom_hmr_{i}", overwrite=True, refine=args.refine,
+                                      z_only=args.z_only)
+        if args.z_only:
+            print(f"z-only {i}: {result['z_only']}", flush=True)
+            for label, report in (result["z_only"] or {}).items():
+                if "middle" not in report:
+                    continue
+                k = "xyz".index(report["axis"])
+                worst_other = 0.0
+                for frame in range(frames):
+                    cmds.currentTime(frame, update=True)
+                    r = cmds.getAttr(report["middle"] + ".rotate")[0]
+                    worst_other = max([worst_other] + [abs(r[n]) for n in range(3) if n != k])
+                print(f"{label}: {report['middle']} keeps only {report['axis'].upper()}, other axes at most "
+                      f"{worst_other:.5f} deg on the final layer", flush=True)
+                assert worst_other <= 1e-3, worst_other
         print(f"apply {i}: layer {result['layer']}, connected {result['check']}, layer {result['baked_check']}", flush=True)
     assert not cmds.namespace(exists=character.CHAR_NS)
     assert layers.layer_info(result["layer"])["mode"] == "custom_hmr"
@@ -119,7 +134,11 @@ def run(args):
                 b = om.MMatrix(cmds.getAttr(reference[n] + ".worldMatrix[0]"))
                 worst[n][0] = max(worst[n][0], math.sqrt(sum((a[i] - b[i]) ** 2 for i in (12, 13, 14))))
                 worst[n][1] = max(worst[n][1], character._angle(character._rotation(a), character._rotation(b)))
-        deg = max(worst, key=lambda n: worst[n][1])
+        # Z-only elbows: the upper arm / forearm twist is the rig's own, the rest stays exact.
+        twisted = {n for n in worst if args.z_only and character.ARM_TWIST.fullmatch(n)}
+        if twisted:
+            print(f"arm twist joints (not checked): up to {max(worst[n][1] for n in twisted):.2f} deg", flush=True)
+        deg = max((n for n in worst if n not in twisted), key=lambda n: worst[n][1])
         cm = max(worst, key=lambda n: worst[n][0])
         print(f"vs FlowHMR export, {len(names)} joints x {frames} frames: worst {worst[deg][1]:.6f} deg ({deg}), "
               f"{worst[cm][0]:.6f} cm ({cm})", flush=True)
@@ -209,6 +228,7 @@ if __name__ == "__main__":
     parser.add_argument("--stack", action="store_true")
     parser.add_argument("--fail", choices=("probe", "connect"))
     parser.add_argument("--refine", action="store_true")
+    parser.add_argument("--z-only", action="store_true", help="Z-only FK elbows (arm twist joints reported, not checked)")
     parser.add_argument("--saved", type=Path, help="folder with model.fbx and saved.json (HMR's saved character)")
     parser.add_argument("--corrections", type=Path, help="extra 校正值 to add to the saved ones (JSON)")
     parser.add_argument("--out", type=Path)

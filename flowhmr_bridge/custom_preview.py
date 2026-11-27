@@ -28,7 +28,7 @@ import maya.api.OpenMaya as om
 import maya.api.OpenMayaAnim as oma
 import maya.cmds as cmds
 
-from . import character, generic, layers, mapping, raw
+from . import character, generic, hinge, layers, mapping, raw
 from . import timing as timing_mod
 from .adv import ApplyError, count_flips
 
@@ -447,11 +447,37 @@ def _check_frames(start, end, count=6):
     return character._check_frames(start, end, count)
 
 
+def arm_chains(chains, probed, namespace):
+    """[(label, (upper arm, forearm, hand) controls, their probed joints as full paths)] from the
+    profile's FK arm links, for the Z-only elbow option."""
+    found = []
+    for word, label in (("Left", "左臂"), ("Right", "右臂")):
+        controls = []
+        for source in (f"{word}Arm", f"{word}ForeArm", f"{word}Hand"):
+            control = next((namespace + c for chain in chains for s, c in chain["links"] if s == source), None)
+            controls.append(control)
+        if not all(controls):
+            continue
+        joints = [probed.get(c, {}).get("primary") for c in controls]
+        if all(joints):
+            found.append((label, tuple(controls), tuple(_joint(namespace, j) for j in joints)))
+    return found
+
+
+def _inside(path, chain_joints):
+    """Joint ``path`` lies on the upper arm or forearm of the chain (shoulder up to, not
+    including, the wrist): its twist is what the Z-only option leaves to the rig."""
+    top, _, end = chain_joints
+    return (path == top or path.startswith(top + "|")) and end.startswith(path + "|")
+
+
 def apply(namespace, profile, source, target_unit=None, log=print, on_connected=None, on_baked=None,
-          overwrite=False, label=None, refine=False):
+          overwrite=False, label=None, refine=False, z_only=False):
     """Bake the job's preview solve (``source`` = client.preview_source) onto the rig in ``namespace``
     ("" or "Ns:") through ``profile``. The result goes on a new override animation layer.
-    ``refine`` solves the spread controls numerically (slow) instead of following one joint."""
+    ``refine`` solves the spread controls numerically (slow) instead of following one joint.
+    ``z_only`` keeps only the Z bend on the FK elbows (hinge.clean_baked): arm positions and the
+    hands stay, followers on the upper arm and forearm are left out."""
     started = time.time()
     if isinstance(profile, (str, Path)):
         profile = generic.load_profile(profile)
@@ -585,11 +611,19 @@ def apply(namespace, profile, source, target_unit=None, log=print, on_connected=
                 continue
             kind = "parent" if control == root_control or targets.translates(joint) else "orient"
             found.append((joint, control, kind))
+        arms = arm_chains(chains, probed, namespace) if z_only else []
+        dropped = []
         for joint, control, kind in follower_list:
-            if not _joint(namespace, joint):
+            path = _joint(namespace, joint)
+            if not path:
                 unpaired.append(f"{joint}（找不到關節）")
                 continue
+            if any(_inside(path, joints) for _, _, joints in arms):
+                dropped.append(_short(control))
+                continue
             found.append((joint, control, "parent" if targets.translates(joint) else kind))
+        if dropped:
+            log(f"手肘只轉單軸：上臂、前臂的 {len(dropped)} 個跟隨控制器不套用，扭轉交給 rig：{', '.join(dropped[:6])}")
         # FlowHMR joint -> rig joint for the IK limbs: the solver slots, else (HMR's saved mapping,
         # which the records do not label) the probed joints of the profile's FK chain.
         by_source = {}
@@ -677,6 +711,21 @@ def apply(namespace, profile, source, target_unit=None, log=print, on_connected=
         finally:
             cmds.refresh(suspend=False)
         cmds.delete(character._constraints())
+        hinge_report = None
+        if z_only:
+            usable = []
+            for name, controls, joints in arms:
+                problem = hinge.usable(controls)
+                if problem:
+                    log(f"{name}不能改成手肘只轉單軸：{problem}")
+                else:
+                    usable.append((name, controls, joints))
+            if not arms:
+                log("手肘只轉單軸：設定檔沒有完整的 FK 上臂、前臂、手腕，沒有修正。")
+            hinge_report = hinge.clean_baked(usable, frames)
+            if hinge_report:
+                log(hinge.describe(hinge_report) + ("。上臂、前臂的扭轉改由 rig 分配，和預覽不同；手臂位置和手掌方向不變。"
+                                                     if hinge.cleaned(hinge_report) else "。"))
         curves = sorted({c for control in kinds for c in cmds.listConnections(control, s=True, d=False, type="animCurveTA") or []})
         flips = count_flips(curves)
         if curves:
@@ -704,7 +753,7 @@ def apply(namespace, profile, source, target_unit=None, log=print, on_connected=
         return {"namespace": namespace, "profile": profile.get("name"), "layer": layer, "check": check,
                 "baked_check": baked, "driven_controls": len(kinds), "skipped_controls": [_short(c) for c in skipped],
                 "probe": {k: [_short(c) for c in v] for k, v in kinds_count.items()}, "loose_joints": loose,
-                "refine": refine_report, "bake_range_30fps": (start, end), "euler_flips_fixed": flips, "keys": keys,
+                "refine": refine_report, "z_only": hinge_report, "bake_range_30fps": (start, end), "euler_flips_fixed": flips, "keys": keys,
                 "time_unit": cmds.currentUnit(q=True, time=True), "fps": timing_mod.scene_fps(),
                 "seconds": round(time.time() - started, 2)}
     except Exception as error:

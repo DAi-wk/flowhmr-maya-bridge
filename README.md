@@ -8,12 +8,29 @@
 
 ## 需求
 
-- FlowHMR 桌面版，和 Maya 在同一台電腦上執行（測試版本 v0.3.9）。
+- FlowHMR 桌面版或網頁版，和 Maya 在同一台電腦上執行（測試版本 v0.3.9）。
 - Maya 2025（Python 3）。Maya 2024 應該也能用，但沒有完整測過。
-- ADV 模式需要 AdvancedSkeleton（測試版本 6.755）。自訂模式不需要任何外掛。
+- 「AdvancedSkeleton 動捕庫」模式需要 AdvancedSkeleton 本身（測試版本 6.755）。其他 ADV 模式只需要場景裡的 ADV rig，不用載入 AdvancedSkeleton；自訂模式不需要任何外掛。
 - 「原始動作 → ADV」需要 Maya 的 PATH 找得到 Node.js（22.15 以上，實測 24.16）。面板上方的 FlowHMR 資料夾應指向目前使用的桌面版。
 
-面板會讀 FlowHMR 資料夾裡的 `.cache/desktop-port.txt` 找連線埠，找不到時用預設的 60550。FlowHMR 資料夾的位置可以在面板上填，或設定環境變數 `FLOWHMR_ROOT`；兩者都沒有時，會找這個 repo 旁邊名為 `FlowHMR` 的資料夾。
+**連線埠**：面板上方的「埠號」預設是「自動」，會依序試下面幾個，用第一個有回應的 FlowHMR：
+1. 桌面版記錄的埠號（FlowHMR 資料夾裡的 `.cache/desktop-port.txt`）
+2. 網頁版記錄的埠號（`start-web.cmd -ServerOnly -Port <埠號>` 寫在 `logs/web-process.json`）
+3. 60550（桌面版和 `start-web.cmd` 的預設值）
+4. 8080（直接執行 `app.py` 的預設值）
+
+網頁版用了其他埠號時，在「埠號」直接輸入即可，面板會記住。只會連本機（127.0.0.1）。FlowHMR 資料夾的位置可以在面板上填，或設定環境變數 `FLOWHMR_ROOT`；兩者都沒有時，會找這個 repo 旁邊名為 `FlowHMR` 的資料夾。
+
+**AdvancedSkeleton 的位置**：只有「AdvancedSkeleton 動捕庫」模式會用到 AdvancedSkeleton 本身的程式，它解壓縮在哪裡都可以。面板依序找：
+1. 這次開 Maya 後已經載入的 ADV
+2. 上次找到或手動指定的位置
+3. ADV 安裝時建立的工具列按鈕所指的 `AdvancedSkeleton.mel`
+4. Maya 的 script 路徑
+5. Maya 使用者資料夾裡的 `AdvancedSkeleton*` 資料夾
+
+同時找到好幾份時，用版本最新的。找到後會記住。都找不到時，面板照常開啟，只有動捕庫模式不能用，可以按「目標 rig」旁的 **ADV…** 指定 `AdvancedSkeleton.mel`。
+
+其他 ADV 模式（原始動作、角色 FBX）回到 build pose 時，不呼叫 ADV 的 `asGoToBuildPose`，而是直接讀 rig 裡 `buildPose` 節點記錄的指令，只執行其中的 setAttr 和 xform。實測在 ADV 6.755 測試 rig 上：把 421 個控制器的 3325 個通道打亂後，結果和 `asGoToBuildPose` 完全相同；ADV 沒記錄的 `FKroot_M` 等控制器，原本就另外歸零。沒有載入 ADV 時，原始動作模式和 HMR 匯出逐幀比對仍是 0.00005° / 0.00001 cm。
 
 ## 安裝
 
@@ -30,14 +47,16 @@ flowhmr_bridge.ui.show()
 
 ## 使用
 
-1. 啟動 FlowHMR 桌面版，在那邊匯入影片、選人、生成。面板會自動連線，每 3 秒更新一次任務列表。
+1. 啟動 FlowHMR（桌面版或網頁版），在那邊匯入影片、選人、生成。面板會自動連線，每 3 秒更新一次任務列表。
 2. 在 Maya 開場景，把 rig 參照或匯入進來。rig 已經有動畫也可以，見下方「動畫層與覆蓋」。
-3. 在面板中選一個「完成」的任務，再選 **rig 類型**：
+3. 在面板中選一個「完成」的任務，再選 **rig 類型**。選單上面兩個（白字）是 HMR 預覽求解器的模式，結果和 HMR 的角色預覽相同，建議使用；下面三個（灰字）是舊版模式。
    - **原始動作 → ADV（HMR 預覽求解器）**：選目標 rig，按 **用原始動作套用到 ADV rig**。動作直接來自任務。
-   - **AdvancedSkeleton**：選目標 rig，按 **套用到 ADV rig**。
-   - **自訂對應**：選一份對應設定，面板會自動找出場景裡符合的 namespace，按 **套用到自訂 rig**。還沒有設定時，按 **新增…** 開啟自訂對應面板。
-   - **自訂對應＋HMR 預覽求解**：同一份對應設定，但改用 HMR 預覽的求解器，結果和 HMR 的角色預覽相同，見下方「自訂對應＋HMR 預覽求解」。
-   - **HMR 角色 FBX**：ADV rig 照 FlowHMR 預覽裡的角色動作，見下方「HMR 角色 FBX」。
+   - **自訂對應＋HMR 預覽求解**：任意 rig，用一份對應設定，改用 HMR 預覽的求解器，見下方「自訂對應＋HMR 預覽求解」。
+   - 舊版 **AdvancedSkeleton 動捕庫**：選目標 rig，按 **套用到 ADV rig**。
+   - 舊版 **自訂對應（校正對齊）**：選一份對應設定，面板會自動找出場景裡符合的 namespace，按 **套用到自訂 rig**。還沒有設定時，按 **新增…** 開啟自訂對應面板。
+   - 舊版 **HMR 角色 FBX**：ADV rig 照 FlowHMR 預覽裡的角色動作，見下方「HMR 角色 FBX」。
+
+   兩個 HMR 預覽求解模式都可以勾 **手肘只轉 Z**，見下方「手肘只轉 Z」。
 4. 選完成後的幀率，按套用。FlowHMR 的動作會放在一個新的動畫層上。
 
 ### 原始動作 → ADV
@@ -227,6 +246,32 @@ Hive 測試 rig 的手腕在 IK 模式下，是透過額外加上的一層控制
 - IK 手腳跟著求解的手腳末端擺放，但 IK 只能單軸彎，手肘、膝蓋的扭轉會和預覽不同；要完全一致請讓四肢顯示 FK。
 - 研究過程與完整數據在 `research/README.md`。
 
+## 手肘只轉 Z（可選）
+
+動畫師 key 手肘通常只轉一個軸（ADV 是 Z）。HMR 預覽求解出來的手肘，除了彎曲還帶扭轉和外擺：在 ADV 測試 rig 上平均離「只轉 Z」約 50°。
+
+勾選 **手肘只轉 Z** 後，烘焙完會逐幀改寫 FK 手臂：
+- 手肘控制器只留 Z，X/Y 改成上臂沿骨頭的扭轉，再加上 Z 彎曲。
+- 肩、肘、腕的位置不變。
+- 手腕控制器的世界旋轉照原本的，所以手掌方向不變。
+- 上臂、前臂的扭轉改由 rig 自己分配，和 HMR 預覽不同。所以上臂、前臂的 Micro／跟隨控制器在這個選項下不會套用。
+
+計算方式參考獨立的 IK/FK 切換工具裡的「清除肘／膝 X/Y」，只讀寫控制器和關節，不呼叫 AdvancedSkeleton 的程式。
+
+彎曲軸會從動作判斷：在手肘控制器自己的座標裡，看手臂實際繞哪一軸彎，ADV 是 Z。手肘以別的軸彎曲的 rig 會改成只轉那一軸，例如 Hive 測試 rig 是 Y。以下情況會略過那隻手臂，log 會寫原因：
+- 判斷不出明確的彎曲軸（主軸不到 60%）。
+- 上臂、前臂、手腕的旋轉被鎖住。
+- 用了非等比縮放。
+
+實測（Maya 2025、mayapy、303 幀測試動作）：
+
+| rig | 彎曲軸 | 手肘其他兩軸（最終動畫層） | 上臂多轉（左／右） | 和 HMR 比 |
+|---|---|---|---|---|
+| ADV 測試 rig（原始動作模式，有／沒有 namespace；自訂＋HMR 加內建範本） | Z | 0.00000° | 最多 48° / 53° | 和 HMR 匯出的角色 FBX 逐幀比，70 個關節的位置 0.00001 cm；手腕、手指和其他關節的旋轉 0.00005°；只有 12 個上臂、前臂扭轉關節不同（最多 46°） |
+| Hive 測試 rig（自訂＋HMR） | Y（自動判斷） | 0.00000° | 最多 39° / 44° | 修正前後，肩、肘、腕的位置沒有變 |
+
+研究過程（為什麼是這三個量、差距多大）見 `research/README.md` 的「前臂（FK 手肘）只轉 Z 軸」。
+
 ## 動畫層與覆蓋
 
 每次套用都會建立一個新的**覆蓋（override）動畫層**，名稱是 `FlowHMR_<namespace>_<影片名>`，FlowHMR 的動作全部在這一層上：
@@ -279,6 +324,7 @@ rig 已經有動畫時，要勾選 **rig 已有動畫時也套用**。套用時�
 | `flowhmr_bridge/ui.py` | Maya 主面板與動作來源選擇 |
 | `flowhmr_bridge/raw.py`、`preview_solve.mjs` | 原始 SMPL-H 到 ADV 控制器，使用安裝版的 HMR 角色求解器 |
 | `stage_raw_test.py` | 獨立 mayapy 驗證，可用已匯出的角色 FBX 逐幀比對最終動畫層和 Part 關節 |
+| `flowhmr_bridge/hinge.py` | 手肘只轉 Z：把烘焙好的 FK 手臂改成手肘只轉 Z，位置和手掌方向不變 |
 | `flowhmr_bridge/custom_preview.py` | 自訂對應＋HMR 預覽求解：探測控制器、在 rig 蒙皮骨架上求解、讓控制器跟著、烘焙並比對 |
 | `stage_custom_hmr_test.py` | 上面這個模式的 mayapy 驗證：和角色 FBX 逐幀比對、靜音後的設定、疊套用、強制失敗 |
 | `research/` | 「自訂對應能多接近 HMR 預覽」的研究腳本與結果 |

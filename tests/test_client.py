@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from flowhmr_bridge.client import FlowHMRClient, FlowHMRError, discover_port, summarize  # noqa: E402
+from flowhmr_bridge.client import FlowHMRClient, FlowHMRError, discover_port, discover_ports, summarize  # noqa: E402
 
 
 def _free_port():
@@ -59,6 +59,56 @@ class OfflineTests(unittest.TestCase):
     def test_missing_port_file_falls_back(self):
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(discover_port(folder), 60550)
+
+    def test_port_candidates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.assertEqual(discover_ports(folder), [60550, 8080])
+            (Path(folder) / ".cache").mkdir()
+            (Path(folder) / ".cache" / "desktop-port.txt").write_text("60551", encoding="ascii")
+            (Path(folder) / "logs").mkdir()
+            # start-web.ps1 writes this through PowerShell, with a byte-order mark
+            (Path(folder) / "logs" / "web-process.json").write_text('{"port": 8123, "pid": 1}', encoding="utf-8-sig")
+            self.assertEqual(discover_ports(folder), [60551, 8123, 60550, 8080])
+            self.assertEqual(discover_port(folder), 60551)
+
+    def test_fixed_port_is_kept(self):
+        client = FlowHMRClient(port=_free_port(), timeout=0.5)
+        port = client.port
+        self.assertFalse(client.locate(timeout=0.2))
+        self.assertEqual(client.port, port)
+
+    def test_locate_finds_the_web_server(self):
+        import http.server
+        import json as json_mod
+        import threading
+
+        class Info(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = json_mod.dumps({"fps": 30} if self.path == "/api/info" else {}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Info)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                (Path(folder) / ".cache").mkdir()
+                (Path(folder) / ".cache" / "desktop-port.txt").write_text(str(_free_port()), encoding="ascii")
+                (Path(folder) / "logs").mkdir()
+                (Path(folder) / "logs" / "web-process.json").write_text(
+                    json_mod.dumps({"port": server.server_port}), encoding="utf-8-sig")
+                client = FlowHMRClient(root=folder)
+                self.assertNotEqual(client.port, server.server_port)
+                self.assertTrue(client.locate(timeout=0.5))
+                self.assertEqual(client.port, server.server_port)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_bad_job_id_is_refused(self):
         with self.assertRaises(FlowHMRError):
