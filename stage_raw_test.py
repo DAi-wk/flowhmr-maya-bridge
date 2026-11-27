@@ -34,7 +34,8 @@ def run(args):
     settings = list(raw.neck_twist_weights(namespace).values()) + list(raw.spine_holds(namespace))
     cmds.currentTime(0)
     original = {p: cmds.getAttr(p) for p in settings}
-    result = character.apply(main, preview_source=source, label="raw_parity", overwrite=True, z_only=args.z_only)
+    result = character.apply(main, preview_source=source, label="raw_parity", overwrite=True, z_only=args.z_only,
+                             z_only_knees=args.z_only_knees)
     assert not cmds.namespace(exists=character.CHAR_NS)
     assert layers.layer_info(result["layer"])["mode"] == "raw"
     cmds.setAttr(result["layer"] + ".mute", True)
@@ -62,31 +63,54 @@ def run(args):
                          and n[len(base) + 4:-(len(side) + 1)].isdigit())
     maximum = {joint: [0.0, 0.0] for joint in names}
     assert character.key_range(reference) == (0, frames - 1)
-    elbow_xy = 0.0
+    hinged = [(limb, names) for limb, names, on in (("arm", ("Shoulder", "Elbow"), args.z_only),
+                                                     ("leg", ("Hip", "Knee"), args.z_only_knees)) if on]
+    middle_xy = {limb: 0.0 for limb, _ in hinged}
+    # Frame-to-frame turn of the elbow / knee joint, rig vs the export: a jump the export does not
+    # have is a twist pop from the single-axis rewrite. (That joint carries the whole upper-bone
+    # roll; ADV shares it out of the shoulder / hip joint over the Part joints.)
+    starts = {f"{names[1]}_{side}": [] for _, names in hinged for side in ("L", "R")}
+    previous = {}
     for frame in range(frames):
         cmds.currentTime(frame)
-        if args.z_only:
+        for limb, names in hinged:
             for side in ("L", "R"):
-                r = cmds.getAttr(f"{namespace}FKElbow_{side}.rotate")[0]
-                elbow_xy = max(elbow_xy, abs(r[0]), abs(r[1]))
+                r = cmds.getAttr(f"{namespace}FK{names[1]}_{side}.rotate")[0]
+                middle_xy[limb] = max(middle_xy[limb], abs(r[0]), abs(r[1]))
         for joint, errors in maximum.items():
             a = cmds.getAttr(namespace + joint + ".worldMatrix[0]")
             b = cmds.getAttr(reference[joint] + ".worldMatrix[0]")
             errors[0] = max(errors[0], (om.MVector(*a[12:15]) - om.MVector(*b[12:15])).length())
             errors[1] = max(errors[1], character._angle(character._rotation(a), character._rotation(b)))
+        for joint, jumps in starts.items():
+            now = (character._rotation(cmds.getAttr(namespace + joint + ".worldMatrix[0]")),
+                   character._rotation(cmds.getAttr(reference[joint] + ".worldMatrix[0]")))
+            if joint in previous:
+                jumps.append(character._angle(previous[joint][0], now[0]) - character._angle(previous[joint][1], now[1]))
+            previous[joint] = now
     for joint, (cm, deg) in sorted(maximum.items()):
         print(f"{joint:24} {cm:8.4f} cm  {deg:8.4f} deg", flush=True)
-    # Z-only elbows: the upper arm / forearm twist is the rig's own, everything else stays exact.
-    twisted = {j for j in maximum if args.z_only and character.ARM_TWIST.fullmatch(j)}
+    # Single-axis elbows / knees: the twist along those bones is the rig's own and, near
+    # straight, the elbow / knee may move a little; everything else stays exact.
+    patterns = [p for p, on in ((character.ARM_TWIST, args.z_only), (character.LEG_TWIST, args.z_only_knees)) if on]
+    twisted = {j for j in maximum if any(p.fullmatch(j) for p in patterns)}
     rotation = max(deg for j, (_, deg) in maximum.items() if j not in twisted)
-    position = max(cm for cm, _ in maximum.values())
+    position = max(cm for j, (cm, _) in maximum.items() if j not in twisted)
     print(f"{frames} frames, {len(moving)} animated joints, {len(maximum)} including Part joints, "
           f"worst position {position:.6f} cm, rotation {rotation:.6f} deg"
-          + (f" (without {len(twisted)} arm twist joints, up to {max(maximum[j][1] for j in twisted):.2f} deg; "
-             f"FK elbow X/Y at most {elbow_xy:.5f} deg)" if twisted else ""), flush=True)
-    if args.z_only:
+          + (f" (without {len(twisted)} twist joints: up to {max(maximum[j][1] for j in twisted):.2f} deg, "
+             f"{max(maximum[j][0] for j in twisted):.4f} cm)" if twisted else ""), flush=True)
+    if hinged:
         print("z-only:", result["z_only"], flush=True)
-        assert elbow_xy <= 1e-3, elbow_xy
+        for limb, names in hinged:
+            print(f"FK{names[1]} other axes at most {middle_xy[limb]:.5f} deg", flush=True)
+            assert middle_xy[limb] <= 1e-3, (limb, middle_xy[limb])
+        shift = max(r.get("max_shift_cm", 0.0) for r in result["z_only"].values())
+        moved = max(maximum[j][0] for j in twisted)
+        assert moved <= shift + 1e-3, (moved, shift)
+        for joint, jumps in starts.items():
+            print(f"{joint}: frame-to-frame turn at most {max(jumps):.2f} deg more than the export", flush=True)
+            assert max(jumps) <= args.max_jump, (joint, max(jumps))
     assert rotation <= args.max_rotation, (rotation, args.max_rotation)
     assert position <= args.max_position, (position, args.max_position)
 
@@ -102,6 +126,9 @@ if __name__ == "__main__":
     parser.add_argument("--rig-only", action="store_true", help="measure the build-pose solve without saved character data")
     parser.add_argument("--reference", type=Path, help="independent character export for a full frame-by-frame check")
     parser.add_argument("--z-only", action="store_true", help="Z-only FK elbows; arm twist joints are reported, not checked")
+    parser.add_argument("--z-only-knees", action="store_true", help="Z-only FK knees; leg twist joints are reported, not checked")
+    parser.add_argument("--max-jump", type=float, default=15.0,
+                        help="degrees per frame the elbow / knee joint may turn beyond the export (twist pops)")
     parser.add_argument("--max-rotation", type=float, default=0.05, help="degrees on the tested rig")
     parser.add_argument("--max-position", type=float, default=0.01, help="centimetres on the tested rig")
     args = parser.parse_args()

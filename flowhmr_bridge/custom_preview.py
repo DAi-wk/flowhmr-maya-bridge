@@ -447,37 +447,45 @@ def _check_frames(start, end, count=6):
     return character._check_frames(start, end, count)
 
 
-def arm_chains(chains, probed, namespace):
-    """[(label, (upper arm, forearm, hand) controls, their probed joints as full paths)] from the
-    profile's FK arm links, for the Z-only elbow option."""
+LIMB_SOURCES = {  # FlowHMR joints of the start, middle and end controls; labels for left, right
+    "arm": (("Arm", "ForeArm", "Hand"), ("左臂", "右臂")),
+    "leg": (("UpLeg", "Leg", "Foot"), ("左腿", "右腿")),
+}
+
+
+def limb_chains(chains, probed, namespace, limbs):
+    """[(label, limb, (start, middle, end) controls, their probed joints as full paths)] from the
+    profile's FK links, for the single-axis elbow / knee options (``limbs`` from "arm", "leg")."""
     found = []
-    for word, label in (("Left", "左臂"), ("Right", "右臂")):
-        controls = []
-        for source in (f"{word}Arm", f"{word}ForeArm", f"{word}Hand"):
-            control = next((namespace + c for chain in chains for s, c in chain["links"] if s == source), None)
-            controls.append(control)
-        if not all(controls):
-            continue
-        joints = [probed.get(c, {}).get("primary") for c in controls]
-        if all(joints):
-            found.append((label, tuple(controls), tuple(_joint(namespace, j) for j in joints)))
+    for limb in limbs:
+        names, labels = LIMB_SOURCES[limb]
+        for word, label in zip(("Left", "Right"), labels):
+            controls = []
+            for source in (word + n for n in names):
+                control = next((namespace + c for chain in chains for s, c in chain["links"] if s == source), None)
+                controls.append(control)
+            if not all(controls):
+                continue
+            joints = [probed.get(c, {}).get("primary") for c in controls]
+            if all(joints):
+                found.append((label, limb, tuple(controls), tuple(_joint(namespace, j) for j in joints)))
     return found
 
 
 def _inside(path, chain_joints):
-    """Joint ``path`` lies on the upper arm or forearm of the chain (shoulder up to, not
-    including, the wrist): its twist is what the Z-only option leaves to the rig."""
+    """Joint ``path`` lies on the upper or lower bone of the chain (start joint up to, not
+    including, the end joint): its twist is what the single-axis option leaves to the rig."""
     top, _, end = chain_joints
     return (path == top or path.startswith(top + "|")) and end.startswith(path + "|")
 
 
 def apply(namespace, profile, source, target_unit=None, log=print, on_connected=None, on_baked=None,
-          overwrite=False, label=None, refine=False, z_only=False):
+          overwrite=False, label=None, refine=False, z_only=False, z_only_knees=False):
     """Bake the job's preview solve (``source`` = client.preview_source) onto the rig in ``namespace``
     ("" or "Ns:") through ``profile``. The result goes on a new override animation layer.
     ``refine`` solves the spread controls numerically (slow) instead of following one joint.
-    ``z_only`` keeps only the Z bend on the FK elbows (hinge.clean_baked): arm positions and the
-    hands stay, followers on the upper arm and forearm are left out."""
+    ``z_only`` / ``z_only_knees`` keep only the bend axis on the FK elbows / knees
+    (hinge.clean_baked): hands and feet stay, followers on those bones are left out."""
     started = time.time()
     if isinstance(profile, (str, Path)):
         profile = generic.load_profile(profile)
@@ -611,19 +619,22 @@ def apply(namespace, profile, source, target_unit=None, log=print, on_connected=
                 continue
             kind = "parent" if control == root_control or targets.translates(joint) else "orient"
             found.append((joint, control, kind))
-        arms = arm_chains(chains, probed, namespace) if z_only else []
-        dropped = []
+        limbs = [limb for limb, on in (("arm", z_only), ("leg", z_only_knees)) if on]
+        hinged = limb_chains(chains, probed, namespace, limbs)
+        dropped = {}
         for joint, control, kind in follower_list:
             path = _joint(namespace, joint)
             if not path:
                 unpaired.append(f"{joint}（找不到關節）")
                 continue
-            if any(_inside(path, joints) for _, _, joints in arms):
-                dropped.append(_short(control))
+            limb = next((limb for _, limb, _, joints in hinged if _inside(path, joints)), None)
+            if limb:
+                dropped.setdefault(limb, []).append(_short(control))
                 continue
             found.append((joint, control, "parent" if targets.translates(joint) else kind))
-        if dropped:
-            log(f"手肘只轉單軸：上臂、前臂的 {len(dropped)} 個跟隨控制器不套用，扭轉交給 rig：{', '.join(dropped[:6])}")
+        for limb, names in dropped.items():
+            joint_word, upper, lower, _ = hinge.LIMBS[limb]
+            log(f"{joint_word}只轉單軸：{upper}、{lower}的 {len(names)} 個跟隨控制器不套用，扭轉交給 rig：{', '.join(names[:6])}")
         # FlowHMR joint -> rig joint for the IK limbs: the solver slots, else (HMR's saved mapping,
         # which the records do not label) the probed joints of the profile's FK chain.
         by_source = {}
@@ -712,20 +723,20 @@ def apply(namespace, profile, source, target_unit=None, log=print, on_connected=
             cmds.refresh(suspend=False)
         cmds.delete(character._constraints())
         hinge_report = None
-        if z_only:
+        if limbs:
             usable = []
-            for name, controls, joints in arms:
+            for name, limb, controls, joints in hinged:
                 problem = hinge.usable(controls)
                 if problem:
-                    log(f"{name}不能改成手肘只轉單軸：{problem}")
+                    log(f"{name}不能改成{hinge.LIMBS[limb][0]}只轉單軸：{problem}")
                 else:
-                    usable.append((name, controls, joints))
-            if not arms:
-                log("手肘只轉單軸：設定檔沒有完整的 FK 上臂、前臂、手腕，沒有修正。")
+                    usable.append((name, limb, controls, joints))
+            for limb, missing in (("arm", "上臂、前臂、手腕"), ("leg", "大腿、小腿、腳踝")):
+                if limb in limbs and not any(entry[1] == limb for entry in hinged):
+                    log(f"{hinge.LIMBS[limb][0]}只轉單軸：設定檔沒有完整的 FK {missing}，沒有修正。")
             hinge_report = hinge.clean_baked(usable, frames)
             if hinge_report:
-                log(hinge.describe(hinge_report) + ("。上臂、前臂的扭轉改由 rig 分配，和預覽不同；手臂位置和手掌方向不變。"
-                                                     if hinge.cleaned(hinge_report) else "。"))
+                log(hinge.describe(hinge_report))
         curves = sorted({c for control in kinds for c in cmds.listConnections(control, s=True, d=False, type="animCurveTA") or []})
         flips = count_flips(curves)
         if curves:

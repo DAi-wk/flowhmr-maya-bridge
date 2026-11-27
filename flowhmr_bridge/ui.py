@@ -39,6 +39,7 @@ OPTION_CHAR_DIR = "flowhmrBridgeCharacterDir"
 OPTION_REFINE = "flowhmrBridgeRefineSpread"
 OPTION_PORT = "flowhmrBridgePort"  # 0 = find it (desktop app, web server, defaults)
 OPTION_Z_ONLY = "flowhmrBridgeZOnlyElbows"
+OPTION_Z_ONLY_KNEES = "flowhmrBridgeZOnlyKnees"
 CUSTOM_MODES = ("custom", "custom_hmr")
 PREVIEW_MODES = ("raw", "custom_hmr")  # read the job's SMPL-H stream and run FlowHMR's preview solver
 LEGACY_MODES = ("adv", "custom", "character")
@@ -215,14 +216,24 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                                      "每段動作多花 1–4 分鐘；只會用在探測結果是「分散」的控制器。")
         self.refine_check.toggled.connect(lambda on: cmds.optionVar(iv=(OPTION_REFINE, int(on))))
         layout.addWidget(self.refine_check)
-        self.z_only_check = QtWidgets.QCheckBox("手肘只轉 Z（單軸彎曲；手臂位置、手掌方向不變，扭轉交給 rig）")
+        self.z_only_check = QtWidgets.QCheckBox("手肘只轉 Z（單軸彎曲；肩、腕位置和手掌方向不變，扭轉交給 rig）")
         self.z_only_check.setChecked(bool(_option(OPTION_Z_ONLY, 0)))
         self.z_only_check.setToolTip("動畫師 key 手肘通常只轉 Z。勾選後，FK 手肘的 X/Y 會改成上臂沿骨頭的扭轉加上 Z 彎曲："
-                                     "肩、肘、腕的位置和手掌方向不變，但上臂、前臂的扭轉分配會和 HMR 預覽不同"
+                                     "肩、腕的位置和手掌方向不變，但上臂、前臂的扭轉分配會和 HMR 預覽不同"
                                      "（上臂、前臂的 Micro／跟隨控制器不套用）。\n手肘控制器以別的軸彎曲的 rig（例如 Hive 是 Y），"
-                                     "會從動作判斷實際的彎曲軸，改成只轉那一軸。")
+                                     "會從動作判斷實際的彎曲軸，改成只轉那一軸。\n手肘彎不到 30° 時，上臂扭轉會參考前後幾幀平滑，"
+                                     "手肘會移動一點（最多手臂長度的 5%），避免扭轉跳動。")
         self.z_only_check.toggled.connect(lambda on: cmds.optionVar(iv=(OPTION_Z_ONLY, int(on))))
         layout.addWidget(self.z_only_check)
+        self.knee_check = QtWidgets.QCheckBox("膝蓋只轉 Z（單軸彎曲；髖、腳踝位置和腳掌方向不變，扭轉交給 rig）")
+        self.knee_check.setChecked(bool(_option(OPTION_Z_ONLY_KNEES, 0)))
+        self.knee_check.setToolTip("動畫師 key 膝蓋通常只轉 Z。勾選後，FK 膝蓋的 X/Y 會改成大腿沿骨頭的扭轉加上 Z 彎曲："
+                                   "髖、腳踝的位置和腳掌方向不變，但大腿、小腿的扭轉分配會和 HMR 預覽不同"
+                                   "（大腿、小腿的 Micro／跟隨控制器不套用）。\n膝蓋彎不到 30° 時，大腿扭轉會參考前後幾幀平滑，"
+                                   "膝蓋會移動一點（最多腿長的 5%），避免扭轉跳動。\n膝蓋控制器以別的軸彎曲的 rig，"
+                                   "會從動作（不明確時看 rig 本身的預彎）判斷實際的彎曲軸。")
+        self.knee_check.toggled.connect(lambda on: cmds.optionVar(iv=(OPTION_Z_ONLY_KNEES, int(on))))
+        layout.addWidget(self.knee_check)
 
         # character FBX mode (uses the ADV rig row above)
         self.char_box = QtWidgets.QWidget()
@@ -290,6 +301,7 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         self.use_character.setVisible(mode in PREVIEW_MODES)
         self.refine_check.setVisible(mode == "custom_hmr")
         self.z_only_check.setVisible(mode in PREVIEW_MODES)
+        self.knee_check.setVisible(mode in PREVIEW_MODES)
         # The closed box shows the chosen entry in its own colour too (white, or grey for a legacy mode).
         palette = self.mode_combo.palette()
         color = QtGui.QColor(LEGACY_COLOR if mode in LEGACY_MODES else CURRENT_COLOR)
@@ -640,10 +652,11 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
         elif self.mode() == "custom_hmr":
             target = {"mode": "custom_hmr", "profile": self.profile_combo.currentData(),
                       "namespace": self.ns_combo.currentData(), "use_character": self.use_character.isChecked(),
-                      "refine": self.refine_check.isChecked(), "z_only": self.z_only_check.isChecked()}
+                      "refine": self.refine_check.isChecked(), "z_only": self.z_only_check.isChecked(),
+                      "z_only_knees": self.knee_check.isChecked()}
         elif self.mode() == "raw":
             target = {"mode": "raw", "main": self.rig_combo.currentText(), "use_character": self.use_character.isChecked(),
-                      "z_only": self.z_only_check.isChecked()}
+                      "z_only": self.z_only_check.isChecked(), "z_only_knees": self.knee_check.isChecked()}
         else:
             target = {"mode": "adv", "main": self.rig_combo.currentText()}
             folder = adv.staging_root() / job["id"]
@@ -741,13 +754,15 @@ class BridgePanel(MayaQWidgetDockableMixin, QtWidgets.QWidget):
                 elif target["mode"] == "custom_hmr":
                     result = custom_preview.apply(target["namespace"], target["profile"], data, target_unit=unit,
                                                   log=self.log, overwrite=target["overwrite"], label=target["label"],
-                                                  refine=target["refine"], z_only=target["z_only"])
+                                                  refine=target["refine"], z_only=target["z_only"],
+                                                  z_only_knees=target["z_only_knees"])
                 elif target["mode"] == "character":
                     result = character.apply(target["main"], data, target_unit=unit, log=self.log,
                                              overwrite=target["overwrite"], label=target["label"])
                 elif target["mode"] == "raw":
                     result = character.apply(target["main"], preview_source=data, target_unit=unit, log=self.log,
-                                             overwrite=target["overwrite"], label=target["label"], z_only=target["z_only"])
+                                             overwrite=target["overwrite"], label=target["label"], z_only=target["z_only"],
+                                             z_only_knees=target["z_only_knees"])
                 else:
                     result = adv.apply(target["main"], data, target_unit=unit, log=self.log,
                                        overwrite=target["overwrite"], label=target["label"])

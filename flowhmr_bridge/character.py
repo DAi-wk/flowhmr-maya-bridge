@@ -359,26 +359,29 @@ def _constraints():
 
 
 ARM_TWIST = re.compile(r"(Shoulder|Elbow)(Part\d+)?_[LR]")
+LEG_TWIST = re.compile(r"(Hip|Knee)(Part\d+)?_[LR]")
+ADV_LIMBS = {"arm": (("Shoulder", "Elbow", "Wrist"), ("左臂", "右臂")), "leg": (("Hip", "Knee", "Ankle"), ("左腿", "右腿"))}
 
 
-def clean_elbows(namespace, frames, log):
-    """Z-only FK elbows on both arms after the bake (hinge.clean_baked). The FKX joints are the
-    positions kept: with the arm in FK they carry the skin joints."""
+def clean_limbs(namespace, frames, log, limbs):
+    """Z-only FK elbows and/or knees after the bake (hinge.clean_baked, ``limbs`` from "arm",
+    "leg"). The FKX joints are the positions kept: with the limb in FK they carry the skin joints."""
     chains = []
-    for side, label in (("L", "左臂"), ("R", "右臂")):
-        controls = tuple(f"{namespace}FK{j}_{side}" for j in ("Shoulder", "Elbow", "Wrist"))
-        joints = tuple(f"{namespace}FKX{j}_{side}" for j in ("Shoulder", "Elbow", "Wrist"))
-        if not all(cmds.objExists(n) for n in joints):
-            joints = tuple(f"{namespace}{j}_{side}" for j in ("Shoulder", "Elbow", "Wrist"))
-        problem = hinge.usable(controls) or next((f"找不到 {j}" for j in joints if not cmds.objExists(j)), None)
-        if problem:
-            log(f"{label}不能改成手肘只轉單軸：{problem}")
-            continue
-        chains.append((label, controls, joints))
-    report = hinge.clean_baked(chains, frames)
+    for limb in limbs:
+        names, labels = ADV_LIMBS[limb]
+        for side, label in zip(("L", "R"), labels):
+            controls = tuple(f"{namespace}FK{j}_{side}" for j in names)
+            joints = tuple(f"{namespace}FKX{j}_{side}" for j in names)
+            if not all(cmds.objExists(n) for n in joints):
+                joints = tuple(f"{namespace}{j}_{side}" for j in names)
+            problem = hinge.usable(controls) or next((f"找不到 {j}" for j in joints if not cmds.objExists(j)), None)
+            if problem:
+                log(f"{label}不能改成{hinge.LIMBS[limb][0]}只轉單軸：{problem}")
+                continue
+            chains.append((label, limb, controls, joints))
+    report = hinge.clean_baked(chains, frames, axis="z")  # ADV elbows and knees bend on Z
     if report:
-        log(hinge.describe(report) + ("。上臂、前臂的扭轉改由 rig 分配，和預覽不同；手臂位置和手掌方向不變。"
-                                               if hinge.cleaned(report) else "。"))
+        log(hinge.describe(report))
     return report
 
 
@@ -390,12 +393,13 @@ def _check_frames(start, end, count=6):
 
 # ------------------------------------------------------------------ apply
 def apply(main, fbx=None, target_unit=None, log=print, on_connected=None, on_baked=None, overwrite=False,
-          label=None, preview_source=None, z_only=False):
+          label=None, preview_source=None, z_only=False, z_only_knees=False):
     """Bake the exported character motion ``fbx`` onto the ADV rig whose Main control is ``main``.
     The result goes on a new override animation layer. Returns a summary dict; the connection
     check (rig joints vs exported joints with the constraints live, before the bake) is in
-    ``check``. ``z_only``: the FK elbows keep only their Z bend (hinge.clean_baked); arm
-    positions and hands stay, the arm Micro controls are left to the rig's own twist."""
+    ``check``. ``z_only`` / ``z_only_knees``: the FK elbows / knees keep only their Z bend
+    (hinge.clean_baked); hands and feet stay, the Micro controls on those bones are left to the
+    rig's own twist."""
     started = time.time()
     rig = adv.inspect_rig(main, overwrite=overwrite)
     if rig["issues"]:
@@ -465,9 +469,11 @@ def apply(main, fbx=None, target_unit=None, log=print, on_connected=None, on_bak
         else:
             structure = check_structure(namespace, joints, moving)
         found, unmapped = pairs(namespace, moving)
+        # Micro controls on the rewritten bones would put the preview's twist back.
         if z_only:
-            # Micro controls on the upper arm / forearm would put the preview's twist back.
             correctives = [c for c in correctives if not ARM_TWIST.fullmatch(c[0])]
+        if z_only_knees:
+            correctives = [c for c in correctives if not LEG_TWIST.fullmatch(c[0])]
         found.extend(correctives)
         if not any(control == namespace + ROOT_CONTROL for _, control, _ in found):
             raise ApplyError(f"找不到 {ROOT_CONTROL}，或角色 FBX 的 {PELVIS} 沒有動作。")
@@ -506,8 +512,9 @@ def apply(main, fbx=None, target_unit=None, log=print, on_connected=None, on_bak
             cmds.refresh(suspend=False)
         cmds.delete(_constraints())
         hinge_report = None
-        if z_only:
-            hinge_report = clean_elbows(namespace, frames, log)
+        limbs = [limb for limb, on in (("arm", z_only), ("leg", z_only_knees)) if on]
+        if limbs:
+            hinge_report = clean_limbs(namespace, frames, log, limbs)
         cmds.currentTime(start, edit=True, update=True)
         baked = compare(namespace, joints, driven, _check_frames(start, end))
         log(f"烘焙後：{describe(baked)}")

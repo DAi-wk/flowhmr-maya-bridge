@@ -85,25 +85,30 @@ def run(args):
               f"{len(driven)} controls, {len(before['nodes'])} nodes)", flush=True)
         return
 
+    hinged = args.z_only or args.z_only_knees
+    baseline = None
+    if hinged:
+        # The same apply without the single-axis rewrite, sampled on every skin joint and then
+        # removed: what the rewritten limbs are checked against.
+        base = custom_preview.apply(ns, profile, source, label="baseline", overwrite=True, refine=args.refine)
+        tree = custom_preview.deformation_tree(ns)
+        baseline = {p: [] for p in tree}
+        for frame in range(frames):
+            cmds.currentTime(frame, update=True)
+            for p in tree:
+                baseline[p].append(om.MMatrix(cmds.getAttr(p + ".worldMatrix[0]")))
+        layers.remove_layer(base["layer"], restore_range=False)
     runs = 2 if args.stack else 1
     result = None
     for i in range(runs):
         result = custom_preview.apply(ns, profile, source, label=f"custom_hmr_{i}", overwrite=True, refine=args.refine,
-                                      z_only=args.z_only)
-        if args.z_only:
+                                      z_only=args.z_only, z_only_knees=args.z_only_knees)
+        if hinged:
             print(f"z-only {i}: {result['z_only']}", flush=True)
             for label, report in (result["z_only"] or {}).items():
                 if "middle" not in report:
                     continue
-                k = "xyz".index(report["axis"])
-                worst_other = 0.0
-                for frame in range(frames):
-                    cmds.currentTime(frame, update=True)
-                    r = cmds.getAttr(report["middle"] + ".rotate")[0]
-                    worst_other = max([worst_other] + [abs(r[n]) for n in range(3) if n != k])
-                print(f"{label}: {report['middle']} keeps only {report['axis'].upper()}, other axes at most "
-                      f"{worst_other:.5f} deg on the final layer", flush=True)
-                assert worst_other <= 1e-3, worst_other
+                check_hinge(label, report, baseline, frames, args.max_jump, cmds, om, character)
         print(f"apply {i}: layer {result['layer']}, connected {result['check']}, layer {result['baked_check']}", flush=True)
     assert not cmds.namespace(exists=character.CHAR_NS)
     assert layers.layer_info(result["layer"])["mode"] == "custom_hmr"
@@ -134,12 +139,15 @@ def run(args):
                 b = om.MMatrix(cmds.getAttr(reference[n] + ".worldMatrix[0]"))
                 worst[n][0] = max(worst[n][0], math.sqrt(sum((a[i] - b[i]) ** 2 for i in (12, 13, 14))))
                 worst[n][1] = max(worst[n][1], character._angle(character._rotation(a), character._rotation(b)))
-        # Z-only elbows: the upper arm / forearm twist is the rig's own, the rest stays exact.
-        twisted = {n for n in worst if args.z_only and character.ARM_TWIST.fullmatch(n)}
+        # Single-axis elbows / knees: the twist along those bones is the rig's own and, near
+        # straight, the elbow / knee may move a little (checked against the baseline above).
+        patterns = [p for p, on in ((character.ARM_TWIST, args.z_only), (character.LEG_TWIST, args.z_only_knees)) if on]
+        twisted = {n for n in worst if any(p.fullmatch(n) for p in patterns)}
         if twisted:
-            print(f"arm twist joints (not checked): up to {max(worst[n][1] for n in twisted):.2f} deg", flush=True)
+            print(f"{len(twisted)} twist joints (not checked here): up to {max(worst[n][1] for n in twisted):.2f} deg, "
+                  f"{max(worst[n][0] for n in twisted):.4f} cm", flush=True)
         deg = max((n for n in worst if n not in twisted), key=lambda n: worst[n][1])
-        cm = max(worst, key=lambda n: worst[n][0])
+        cm = max((n for n in worst if n not in twisted), key=lambda n: worst[n][0])
         print(f"vs FlowHMR export, {len(names)} joints x {frames} frames: worst {worst[deg][1]:.6f} deg ({deg}), "
               f"{worst[cm][0]:.6f} cm ({cm})", flush=True)
         summary["reference"] = {n: [round(c, 6), round(d, 6)] for n, (c, d) in worst.items()}
@@ -147,6 +155,43 @@ def run(args):
         assert worst[deg][1] <= args.max_rotation and worst[cm][0] <= args.max_position
     if args.out:
         args.out.write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
+
+
+def check_hinge(label, report, baseline, frames, max_jump, cmds, om, character):
+    """One rewritten limb against the baseline apply: the middle control keeps one axis, the end
+    joint keeps its world position and rotation, the middle joint moves at most what the report
+    says, and the middle joint (carrying the whole upper-bone roll) turns no faster from frame to
+    frame than in the baseline (+max_jump)."""
+    k = "xyz".index(report["axis"])
+    _, middle, end = report["joints"]
+    other = shift = end_cm = end_deg = 0.0
+    jump = None
+    previous = None
+    for frame in range(frames):
+        cmds.currentTime(frame, update=True)
+        r = cmds.getAttr(report["middle"] + ".rotate")[0]
+        other = max([other] + [abs(r[n]) for n in range(3) if n != k])
+        now = {p: om.MMatrix(cmds.getAttr(p + ".worldMatrix[0]")) for p in (middle, end)}
+        base = {p: baseline[p][frame] for p in now}
+
+        def cm(a, b):
+            return math.sqrt(sum((a[i] - b[i]) ** 2 for i in (12, 13, 14)))
+
+        shift = max(shift, cm(now[middle], base[middle]))
+        end_cm = max(end_cm, cm(now[end], base[end]))
+        end_deg = max(end_deg, character._angle(character._rotation(now[end]), character._rotation(base[end])))
+        if previous:
+            extra = (character._angle(character._rotation(previous[0]), character._rotation(now[middle]))
+                     - character._angle(character._rotation(previous[1]), character._rotation(base[middle])))
+            jump = extra if jump is None else max(jump, extra)
+        previous = (now[middle], base[middle])
+    print(f"{label}: {report['middle']} keeps only {report['axis'].upper()} (other axes at most {other:.5f} deg); "
+          f"end joint off by {end_cm:.5f} cm / {end_deg:.5f} deg, middle joint moved at most {shift:.4f} cm, "
+          f"middle joint turns at most {jump:.2f} deg/frame more than without the rewrite", flush=True)
+    assert other <= 1e-3, other
+    assert end_cm <= 1e-3 and end_deg <= 1e-2, (end_cm, end_deg)
+    assert shift <= report["max_shift_cm"] + 1e-3, (shift, report["max_shift_cm"])
+    assert jump <= max_jump, jump
 
 
 def corrections(args, ns, profile, source, cmds, om, character, custom_preview):
@@ -229,6 +274,9 @@ if __name__ == "__main__":
     parser.add_argument("--fail", choices=("probe", "connect"))
     parser.add_argument("--refine", action="store_true")
     parser.add_argument("--z-only", action="store_true", help="Z-only FK elbows (arm twist joints reported, not checked)")
+    parser.add_argument("--z-only-knees", action="store_true", help="Z-only FK knees (leg twist joints reported, not checked)")
+    parser.add_argument("--max-jump", type=float, default=15.0,
+                        help="degrees per frame the elbow / knee joint may turn beyond the apply without the rewrite")
     parser.add_argument("--saved", type=Path, help="folder with model.fbx and saved.json (HMR's saved character)")
     parser.add_argument("--corrections", type=Path, help="extra 校正值 to add to the saved ones (JSON)")
     parser.add_argument("--out", type=Path)
